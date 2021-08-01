@@ -1,0 +1,2721 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
+
+//defs.h
+
+#define TEXTLEN		 10240	 // 扫描缓存长度
+#define SYMBOL_NUM   10240	 // 符号表长度
+#define PARAM_NUM    10240   // 参数表长度
+#define NOREG	     -1		 // AST生成函数没有要返回的寄存器
+#define NOLABEL      0       // 当我们没有标签传递给AST生成函数时使用
+#define MAXINTS      1024    // 大整数储存上限
+#define SCOPE_NUM    10240   // 作用域长度上限
+
+#define max(a,b)    (a > b ? a : b)   // a,b中的最大值
+#define min(a,b)    (a < b ? a : b)   // a,b中的最小值
+
+// 单词类型
+enum
+{
+    T_EOF,
+    // 运算符
+    T_EQU, T_LOGOR, T_LOGAND, T_EQ, T_NE, T_LT, T_GT, T_LE, T_GE,
+    T_ADD, T_SUB, T_MUL, T_DIV, T_MOD, T_LOGNOT,
+
+    // 数据类型
+    T_VOID, T_KEYINT,
+
+    // 结构类型
+    T_INT, T_COMMA, T_SEM, T_PRINT, T_IDENT,
+    T_LBRACE, T_RBRACE, T_LPAREN, T_RPAREN, T_LBRACKET, T_RBRACKET,
+
+    // 关键词类型
+    T_IF, T_ELSE, T_WHILE,  T_RETURN, T_CONST, T_BREAK, T_CONTINUE
+};
+
+// 单词结构体
+struct token
+{
+    int token;
+    int intvalue;
+};
+
+// AST节点类型
+enum
+{
+    A_ASSIGN = 1, A_LOGOR, A_LOGAND, A_EQ, A_NE, A_LT, A_GT, A_LE, A_GE,
+    A_ADD, A_SUB, A_MUL, A_DIV, A_MOD, A_LOGNOT,
+    A_INT, A_IDENT, A_LVIDENT, A_GLUE, 
+    A_IF, A_PRINT, A_WHILE, A_FUNCTION, A_FUNCTIONCALL, A_RETURN,
+    A_ADDRESS, A_LOGADD, A_NULL, A_CONTINUE, A_BREAK, A_ARRYADD
+};
+
+// 抽象语法树结构体
+struct ASTnode
+{
+    int op;				        // 节点的操作类型
+    int type;			        // 表达式数据类型
+    int rvalue;			        // 节点为右值则为真
+    struct ASTnode *left;
+    struct ASTnode *mid;
+    struct ASTnode *right;
+    union {
+        int intvalue;		    // 对于立即数，储存数值
+        int id;			        // 对于标识符，储存符号表位置
+        int size;               // 对于函数，储存参数数量
+    } v;
+    int address;                // 数组偏移地址
+};
+
+// 结构类型
+enum
+{
+    S_VARIABLE, S_FUNCTION, S_ARRAY
+};
+
+// 数据类型
+enum
+{
+    P_VOID, P_INT
+};
+
+// 变量类型
+enum
+{
+    C_VOID,       // 空变量
+    C_GLOBAL,     // 全局变量
+    C_LOCAL,      // 局部变量
+    C_PARAM		  // 函数参数
+};
+
+// 符号表结构体
+struct symbol_table
+{
+    char *name;			        // 符号名
+    int type;                   // 类型void或int
+    int stype;			        // 结构类型
+    int endlabel;			    // 函数的结束标签
+    int size;                   // 数组大小
+    int gl_class;			    // 符号类别
+    int posn;			        // 距离栈基指针的偏移地址
+    int offset[10];             // 数组维度偏移地址
+    int *value;                 // 变量初始值指针
+};
+
+// decl.h
+int scan(struct token *t);
+int code_generator(struct ASTnode *n, int ifflase, int iftrue, int loopstartlabel, int loopendlabel, int parentASTop);
+struct ASTnode *Block_statement();
+struct ASTnode *binexpr(int pretokentype);
+void lparen();
+void rparen();
+void arm_function_postamble(int id);
+void match(int t, char *what);
+int arm_get_localoffset(int type, int size);
+int label();
+
+// data.h
+int             Line;                               // 当前读入行数
+int	            Putbackchr;                         // 放回字符
+int             Functionid;		                    // 当前函数的符号id
+int             Globals = 0;		                // 全局变量下一个空闲的位置
+int             Locals = SYMBOL_NUM - 1;            // 局部变量下一个空闲的位置
+FILE            *Infile;                            // 输入文件
+FILE		    *Outfile;                           // 输出文件
+struct token	Token;                              // 当前扫描单词
+char Text[TEXTLEN + 1];		                        // 扫描缓存
+struct symbol_table Tsym[SYMBOL_NUM + PARAM_NUM];	// 全局符号表
+int Intlist[MAXINTS];                               // 大整数储存表
+int Intslot = 0;                                    // 大整数数量
+char scope[SCOPE_NUM]="*";                          // 作用域
+int scope_num;                                      // 作用域号
+int use_param_num;                                  // 函数中使用的参数最大值
+int have_param_num;                                 // 函数参数的数量
+int outLine;                                        // 代码输出行数
+
+// stdlib.h
+
+// 整数按进制转字符串
+char* itoa(int num,char* str,int radix)
+{
+	char index[]="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";//索引表
+	unsigned unum;//存放要转换的整数的绝对值,转换的整数可能是负数
+	int i=0,j,k;//i用来指示设置字符串相应位，转换之后i其实就是字符串的长度；转换后顺序是逆序的，有正负的情况，k用来指示调整顺序的开始位置;j用来指示调整顺序时的交换。
+ 
+	//获取要转换的整数的绝对值
+	if(radix==10&&num<0)//要转换成十进制数并且是负数
+	{
+		unum=(unsigned)-num;//将num的绝对值赋给unum
+		str[i++]='-';//在字符串最前面设置为'-'号，并且索引加1
+	}
+	else unum=(unsigned)num;//若是num为正，直接赋值给unum
+ 
+	//转换部分，注意转换后是逆序的
+	do
+	{
+		str[i++]=index[unum%(unsigned)radix];//取unum的最后一位，并设置为str对应位，指示索引加1
+		unum/=radix;//unum去掉最后一位
+ 
+	}while(unum);//直至unum为0退出循环
+ 
+	str[i]='\0';//在字符串最后添加'\0'字符，c语言字符串以'\0'结束。
+ 
+	//将顺序调整过来
+	if(str[0]=='-') k=1;//如果是负数，符号不用调整，从符号后面开始调整
+	else k=0;//不是负数，全部都要调整
+ 
+	char temp;//临时变量，交换两个值时用到
+	for(j=k;j<=(i-1)/2;j++)//头尾一一对称交换，i其实就是字符串的长度，索引最大值比长度少1
+	{
+		temp=str[j];//头部赋值给临时变量
+		str[j]=str[i-1+k-j];//尾部赋值给头部
+		str[i-1+k-j]=temp;//将临时变量的值(其实就是之前的头部值)赋给尾部
+	}
+ 
+	return str;//返回转换后的字符串
+}
+
+// sym.c
+
+// 获得作用域下的变量名
+char *scope_name(char *str)
+{
+    char path[SCOPE_NUM];
+    strcpy(path, str);
+    strcpy(str, scope);
+    strcat(str, path);
+    return str;
+}
+
+// 作用域前进一格
+void advance_scope()
+{
+    char path[10];
+    itoa(scope_num++, path, 10);
+    strcat(scope, path);
+    int length = strlen(scope);
+    scope[length++] = '*';
+    scope[length] = '\0';
+}
+
+// 作用域回退一格
+void back_scope()
+{
+    for (int i = Locals + 1; i < SYMBOL_NUM + (max(have_param_num - 4, 0)); i++)
+    {
+        if (Tsym[i].gl_class != C_VOID && strstr(scope, Tsym[i].name) != NULL)
+        {
+            Tsym[i].gl_class = C_VOID;
+        }
+    }
+    int length = strlen(scope) - 1;
+    while (scope[--length] != '*');
+    scope[length + 1] = '\0';
+}
+
+// 检查符号s是否在全局符号表中。
+// 返回其插槽位置或-1
+int find_global(char *s)
+{
+    int i;
+    for (i = 0; i < Globals; i++)
+    {
+        if (*s == *Tsym[i].name && !strcmp(s, Tsym[i].name))
+        return i;
+    }
+    return -1;
+}
+
+// 获取新的全局符号槽的位置
+int new_global()
+{
+    int p;
+    if ((p = Globals++) >= Locals)
+    {
+        fprintf(stderr, "Too many global symbols on line %d\n", Line);
+        exit(2);
+    }
+    return p;
+}
+
+// 确定符号s是否在本地符号表中,
+// 返回其插槽位置或-1
+int find_local(char *s)
+{
+    char path[SCOPE_NUM], currentp[SCOPE_NUM];
+    strcpy(currentp, scope);
+    while(strlen(currentp) > 1)
+    {
+        strcpy(path, currentp);
+        strcat(path, s);
+        int i;
+        for (i = Locals + 1; i < SYMBOL_NUM + (max(have_param_num - 4, 0)); i++)
+        {
+            if (path[0] == *Tsym[i].name && !strcmp(path, Tsym[i].name))
+            return i;
+        }
+        int length = strlen(currentp) - 1;
+        while (currentp[--length] != '*');
+        currentp[length + 1] = '\0';
+    }
+    return -1;
+}
+
+// 获取新的本地符号槽的位置，
+// 否则位置用完
+int new_local()
+{
+    int p;
+    if ((p = Locals--) <= Globals)
+    {
+        fprintf(stderr, "Too many local symbols on line %d\n", Line);
+        exit(3);
+    }
+    return p;
+}
+
+// 清除本地符号表中的所有条目
+void freeloclsyms(void)
+{
+    Locals = SYMBOL_NUM - 1;
+}
+
+// 更新符号表
+void update_sym(int slot, char *name, int type, int stype, int gl_class, int endlabel, int size, int posn)
+{
+    if (slot < 0 || slot >= SYMBOL_NUM + (max(have_param_num - 4, 0)))
+    {
+        fprintf(stderr, "Invalid symbol slot number in update_sym() on line %d\n", Line);
+        exit(4);
+    }
+    if(gl_class != C_GLOBAL)
+    {
+        int length = strlen(scope) + strlen(name) + 10;
+        char *path = (char *)malloc(sizeof(char) * length);
+        strcpy(path, name);
+        Tsym[slot].name = scope_name(path);
+    }
+    else
+    {
+        Tsym[slot].name = strdup(name);
+    }
+    Tsym[slot].type = type;
+    Tsym[slot].stype = stype;
+    Tsym[slot].gl_class = gl_class;
+    Tsym[slot].endlabel = endlabel;
+    Tsym[slot].size = size;
+    Tsym[slot].posn = posn;
+    Tsym[slot].value = (int *)malloc(size * sizeof(int));
+    *Tsym[slot].value = 0;
+}
+
+// 将全局变量添加到符号表，并返回符号表中的位置
+int add_global(char *name, int type, int stype, int endlabel, int size)
+{
+    int y;
+    // 如果已经在符号表中，则返回现有位置
+    if ((y = find_global(name)) != -1)
+        return y;
+    // 获得一个新的位置，并填入信息和返回位置
+    y = new_global();
+    update_sym(y, name, type, stype, C_GLOBAL, endlabel, size, 0);
+    return y;
+}
+
+// 将局部变量添加到符号表，并返回符号表中的位置
+int add_local(char *name, int type, int stype, int isparam, int size)
+{
+    int y, posn;
+    // 如果已经在符号表中，则返回现有位置
+    if ((y = find_local(name)) != -1)
+        return y;
+    if(isparam)
+    {
+        have_param_num++;
+        if(have_param_num > 4)
+        {
+            update_sym(SCOPE_NUM + have_param_num - 5, name, type, stype, C_PARAM, 0, size, (have_param_num - 5) * 4);
+            y = SCOPE_NUM + have_param_num - 5;
+        }
+        else
+        {
+            // 获得一个新的位置，并填入信息和返回位置
+            y = new_local();
+            posn = arm_get_localoffset(type, size);
+            update_sym(y, name, type, stype, C_PARAM, 0, size, posn);
+        }
+    }
+    else
+    {
+        // 获得一个新的位置，并填入信息和返回位置
+        y = new_local();
+        posn = arm_get_localoffset(type, size);
+        update_sym(y, name, type, stype, C_LOCAL, 0, size, posn);
+    }
+    return y;
+}
+
+// 检查符号s是否在头文件函数符号表中。
+// 返回其插槽位置或-1
+int find_head_function(char *s)
+{
+    int i;
+    for (i = SYMBOL_NUM + 10000; Tsym[i].name != NULL; i++)
+    {
+        if (*s == *Tsym[i].name && !strcmp(s, Tsym[i].name))
+        return i;
+    }
+    return -1;
+}
+
+// 确定符号s是否在符号表中,
+// 返回其插槽位置或-1
+int find_symbol(char *s)
+{
+    int y;
+    y = find_local(s);
+    if (y == -1)
+        y = find_head_function(s);
+    if (y == -1)
+        y = find_global(s);
+    return y;
+}
+
+// scan.c
+
+// 返回字符 c 在字符串 s 中的位置，如果没有找到 c，则返回 -1
+int get_chrpos(char *s, int c)
+{
+    char *p;
+    p = strchr(s, c);
+    return p ? p - s : -1;
+}
+
+// 从输入文件中获取下一个字符
+int get_nextchr(void)
+{
+    int c;
+    if (Putbackchr)
+    {
+        c = Putbackchr;
+        Putbackchr = 0;
+        return c;
+    }
+    c = fgetc(Infile);
+    if ('\n' == c)
+    {
+        Line++;
+    }
+    return c;
+}
+
+// 放回多拿的字符
+void put_backchr(int c)
+{
+    Putbackchr = c;
+}
+
+// 跳过空格、换行符，返回需要处理的第一个字符
+int skip_getchr(void) 
+{
+    int c;
+    c = get_nextchr();
+    while (' ' == c || '\t' == c || '\n' == c || '\r' == c || '\f' == c)
+    {
+        c = get_nextchr();
+    }
+    return c;
+}
+
+// 扫描输入文件，返回一个整数文字值
+int scan_int(int c)
+{
+    int k, val = 0;
+    if(c != '0')
+    {
+        while ((k = get_chrpos("0123456789", c)) >= 0)
+        {
+            val = val * 10 + k;
+            c = get_nextchr();
+        }
+        put_backchr(c);
+    }
+    else
+    {
+        c = get_nextchr();
+        if(c == 'x' || c == 'X')
+        {
+            c = get_nextchr();
+            while ((k = max(get_chrpos("0123456789ABCDEF", c), get_chrpos("0123456789abcdef", c))) >= 0)
+            {
+                val = val * 16 + k;
+                c = get_nextchr();
+            }
+            put_backchr(c);
+        }
+        else
+        {
+            while ((k = get_chrpos("01234567", c)) >= 0)
+            {
+                val = val * 8 + k;
+                c = get_nextchr();
+            }
+            put_backchr(c);
+        }
+    }
+    return val;
+}
+
+// 扫描输入文件中的标识符并将其存储在buf[]中，返回标识符的长度
+int scan_ident(int c, char *buf, int lim)
+{
+    int i = 0;
+    // 允许数字、字母和下划线
+    while (isalpha(c) || isdigit(c) || '_' == c)
+    {
+        // 标识符长度超过限制，则出错；否则添加到buf[]，并获取下一个字符
+        if (lim - 1 == i)
+        {
+            fprintf(stderr, "identifier too long on line %d\n", Line);
+            exit(5);
+        }
+        else if (i < lim - 1)
+        {
+            buf[i++] = c;
+        }
+        c = get_nextchr();
+    }
+    // 遇到分隔符，把它放回去。终止buf[]，并返回长度
+    put_backchr(c);
+    buf[i] = '\0';
+    return i;
+}
+
+// 给定输入中的一个单词，返回匹配的关键字标记号，
+// 如果它不是关键字，则返回0 
+int match_keyword(char *s)
+{
+    switch (*s)
+    {
+        case 'b':   if(!strcmp(s, "break"))  return T_BREAK;
+        case 'c':   if(!strcmp(s, "const"))  return T_CONST;
+                    if(!strcmp(s, "continue")) return T_CONTINUE;
+        case 'e':   if(!strcmp(s, "else"))   return T_ELSE;
+                    break;
+        case 'i':   if(!strcmp(s, "if"))     return T_IF;
+                    if(!strcmp(s, "int"))    return T_KEYINT;
+                    break;
+        case 'p':   if(!strcmp(s, "print"))  return T_PRINT;
+                    break;
+        case 'r':   if(!strcmp(s, "return")) return T_RETURN;
+                    break;
+        case 'w':   if(!strcmp(s, "while"))  return T_WHILE;
+                    break;
+        case 'v':   if(!strcmp(s, "void"))   return T_VOID;
+                    break;
+    }
+    return 0;
+}
+
+// 被丢弃单词的指针
+struct token *Rejtoken = NULL;
+
+// 丢弃刚刚扫描的单词
+void reject_token(struct token *t)
+{
+    if (Rejtoken != NULL)
+    {
+        fprintf(stderr, "Can't reject token twice on line %d\n", Line);
+        exit(6);
+    }
+    Rejtoken = t;
+}
+
+// 单句注释扫描函数
+void single_annotation()
+{
+    char strbuf[MAXINTS];
+    fgets(strbuf, MAXINTS, Infile);
+    Line++;
+    scan(&Token);
+}
+
+// 多句注释扫描函数
+void block_annotation()
+{
+    char c;
+    while(1)
+    {
+        c = fgetc(Infile);
+        if(c == '*')
+        {
+            c = fgetc(Infile);
+            if(c == '/')
+            {
+                scan(&Token);
+                return;
+            }
+        }
+        if (c == '\n') Line++;
+    }
+}
+
+// 扫描并返回在输入中找到的下一个单词。
+// 如果标记有效则返回 1，如果没有标记则返回 0
+int scan(struct token *t)
+{
+    int c, tokentype;
+    // 如果有被丢弃的单词，将其返回
+    if (Rejtoken != NULL)
+    {
+        t = Rejtoken;
+        Rejtoken = NULL;
+        return 1;
+    }
+    c = skip_getchr();
+    switch (c)
+    {
+        case EOF:   t->token = T_EOF;       return 0;
+        case '+':   t->token = T_ADD;       break;
+        case '-':   t->token = T_SUB;       break;
+        case '*':   t->token = T_MUL;       break;
+        case '/':   
+                    c = get_nextchr();
+                    switch (c)
+                    {
+                        case '/':   single_annotation(); break;
+                        case '*':   block_annotation();  break;
+                        default:    t->token = T_DIV;    put_backchr(c);break;
+                    }
+                    break;
+        case '%':   t->token = T_MOD;       break;
+        case ';':   t->token = T_SEM;       break;
+        case '{':   t->token = T_LBRACE;    break;
+        case '}':   t->token = T_RBRACE;    break;
+        case '(':   t->token = T_LPAREN;    break;
+        case ')':   t->token = T_RPAREN;    break;
+        case ',':   t->token = T_COMMA;     break;
+        case '[':   t->token = T_LBRACKET;  break;
+        case ']':   t->token = T_RBRACKET;  break;
+        case '=':   
+                    if((c = get_nextchr()) == '=')
+                    {
+                        t->token = T_EQ;
+                    }
+                    else
+                    {
+                        t->token = T_EQU;
+                        put_backchr(c);
+                    }
+                    break;
+        case '!':   if((c = get_nextchr()) == '=')
+                    {
+                        t->token = T_NE;
+                    }
+                    else
+                    {
+                        put_backchr(c);
+                        t->token = T_LOGNOT;
+                    }
+                    break;
+        case '<':   if((c = get_nextchr()) == '=')
+                    {
+                        t->token = T_LE;
+                    }
+                    else
+                    {
+                        t->token = T_LT;
+                        put_backchr(c);
+                    }
+                    break;
+        case '>':   if((c = get_nextchr()) == '=')
+                    {
+                        t->token = T_GE;
+                    }
+                    else
+                    {
+                        t->token = T_GT;
+                        put_backchr(c);
+                    }
+                    break;
+        case '&':   if ((c = get_nextchr()) == '&')
+                    {
+                        t->token = T_LOGAND;
+                    }
+                    else
+                    {
+                        put_backchr(c);
+                    }
+                    break;
+        case '|':   if ((c = get_nextchr()) == '|')
+                    {
+                        t->token = T_LOGOR;
+                    }
+                    else
+                    {
+                        put_backchr(c);
+                    }
+                    break;
+        default:    if (isdigit(c)) 
+                    {
+                        t->intvalue = scan_int(c);
+                        t->token = T_INT;
+                        break;
+                    }
+                    else if(isalpha(c) || '_' == c)
+                    {
+                        scan_ident(c, Text, TEXTLEN);
+                        if ((tokentype = match_keyword(Text)))
+                        {
+                        	t->token = tokentype;
+	                        break;
+	                    }
+	                    t->token = T_IDENT;
+                        break;
+                    }
+                    fprintf(stderr, "Unrecognised character %c on line %d\n", c, Line);
+                    exit(7);
+    }
+    return 1;
+}
+
+//tree.c
+
+// 生成并返回一个通用的AST节点
+struct ASTnode *mkastnode(int op, struct ASTnode *left, struct ASTnode *mid, struct ASTnode *right, int intvalue)
+{
+    struct ASTnode *n;
+    n = (struct ASTnode *) malloc(sizeof(struct ASTnode));
+    if (n == NULL)
+    {
+        fprintf(stderr, "Unable to malloc in mkastnode()\n");
+        exit(8);
+    }
+    n->op = op;
+    n->left = left;
+    n->mid = mid;
+    n->right = right;
+    n->v.intvalue = intvalue;
+    n->rvalue = 0;
+    return n;
+}
+
+
+// 生成AST叶子节点
+struct ASTnode *mkastleaf(int op, int intvalue)
+{
+    return mkastnode(op, NULL, NULL, NULL, intvalue);
+}
+
+// 生成只有一个左孩子的一元AST节点
+struct ASTnode *mkastunary(int op, struct ASTnode *left, int intvalue)
+{
+    return mkastnode(op, left, NULL, NULL, intvalue);
+}
+
+// expr.c
+
+// 返回一个由A_GLUE节点组成的AST节点树,
+// 左边的孩子是前一个表达式（或 NULL）的子树,
+// 右边的孩子是下一个表达式。
+// 此时，每个A_GLUE节点的size字段将设置为树中表达式的数量。
+// 如果没有解析表达式，则返回NULL。
+struct ASTnode *expression_list()
+{
+    struct ASTnode *tree = NULL;
+    struct ASTnode *child = NULL;
+    int exprcount = 0;
+    // 循环直到右括号
+    while (Token.token != T_RPAREN)
+    {
+        // 解析下一个表达式,并增加表达式计数
+        child = binexpr(0);
+        exprcount++;
+        // 构建一个A_GLUE的AST节点,
+        // 将前一棵树作为左孩子,
+        // 新表达式作为右孩子。
+        // 存储表达式计数。
+        tree = mkastnode(A_GLUE, tree, NULL, child, exprcount);
+        // 匹配","或者")"
+        switch (Token.token)
+        {
+            case T_COMMA:   scan(&Token); break;
+            case T_RPAREN:  break;
+            default:
+                fprintf(stderr, "Unexpected token in expression list:%d on line %d\n", Token.token, Line);
+                exit(9);
+        }
+    }
+    use_param_num = use_param_num > exprcount ? use_param_num : exprcount;
+    // 返回表达式的树
+    return tree;
+}
+
+int ssi = 0;
+// 分析有单个参数的函数调用并返回其AST树
+struct ASTnode *functioncall()
+{
+    ssi++;
+    struct ASTnode *tree;
+    int id;
+    // 检查标识符是否已定义，然后为其创建一个叶节点
+    if ((id = find_symbol(Text)) == -1 || Tsym[id].stype != S_FUNCTION)
+    {
+        fprintf(stderr, "Undeclared function on line %d\n", Line);
+        exit(10);
+    }
+    // 匹配'('
+    lparen();
+    // 分析接下来的表达式
+    tree = expression_list();
+    // 构建函数调用AST节点,将函数的返回类型存储为此节点的类型，
+    // 同时记录函数的符号ID
+    tree = mkastunary(A_FUNCTIONCALL, tree, id);
+    // 匹配')'
+    rparen();
+    return tree;
+}
+
+// 分析数组并为其返回其AST树
+struct ASTnode *array_access()
+{
+    struct ASTnode *left = NULL, *right, *tree, *address;
+    int id, l, local;
+    // 检查标识符是否已定义为数组,
+    // 然后为其创建一个指向基部的叶节点
+    if ((id = find_symbol(Text)) == -1 || Tsym[id].stype != S_ARRAY)
+    {
+        fprintf(stderr, "Undeclared array:%s on line %d\n", Text, Line);
+        exit(11);
+    }
+    if(Tsym[id].gl_class == C_PARAM)
+    {
+        address = mkastleaf(A_IDENT, id);
+    }
+    else
+    {
+        address = mkastleaf(A_ADDRESS, id);
+    }
+    address->rvalue = 1;
+    l = 0;
+    local = find_local(Text);
+    while(Token.token == T_LBRACKET)
+    {
+        // 跳过'['
+        scan(&Token);
+        // 解析接下来的表达式
+        right = binexpr(0);
+        // 匹配']'
+        match(T_RBRACKET, "]");
+        if(Tsym[id].offset[++l] != 1)
+        {
+            tree = mkastleaf(A_INT, Tsym[id].offset[l]);
+            tree = mkastnode(A_MUL, tree, NULL, right, 0);
+        }
+        else
+        {
+            tree = right;
+        }
+        if (left == NULL)   left = tree;
+        else    left = mkastnode(A_ADD, left, NULL, tree, 0);
+    }
+    // if(local != -1 && Tsym[id].gl_class != C_PARAM)
+    // {
+    //     tree = mkastleaf(A_INT, 0);
+    //     left = mkastnode(A_SUB, tree, NULL, left, 0);
+    // }
+    if(left == NULL)
+    {
+        left = mkastleaf(A_INT, 0);
+    }
+    // 返回一个AST树,其中数组的基数添加了偏移量,并取消引用该元素
+    if(Tsym[id].offset[++l] != -1)
+    {
+        left = mkastnode(A_ARRYADD, address, NULL, left, 0);
+    }
+    else
+    {
+        left = mkastnode(A_LOGADD, address, NULL, left, 0);
+    }
+    return left;
+}
+
+// 解析一个整数单词并返回表示它的AST节点
+struct ASTnode *primary()
+{
+    struct ASTnode *n, *tree, *left;
+    int id;
+    switch (Token.token)
+    {
+        // 对于整数单词，为其生成一个AST叶子节点
+        case T_INT:
+            n = mkastleaf(A_INT, Token.intvalue);
+            break;
+        // 对于标识符，检查存在并为其生成一个AST叶子节点
+        case T_IDENT:
+            // 扫描下一个字符判断这单词是变量还是函数调用
+            scan(&Token);
+            // 如果是'(',那这是函数调用
+            if (Token.token == T_LPAREN)   return functioncall();
+            // 如果是'[',那是数组变量
+            if (Token.token == T_LBRACKET) return array_access();
+            // 如果不是函数调用，则丢弃新单词
+            id = find_symbol(Text);
+            if (Tsym[id].stype == S_ARRAY) return array_access();
+            reject_token(&Token);
+            // 检查单词是否存在
+            if (id == -1)
+            {
+                fprintf(stderr, "Unknown variable %s on line %d\n", Text, Line);
+                exit(12);
+            }
+            n = mkastleaf(A_IDENT, id);
+            break;
+        case T_LPAREN:
+            // 括号表达式的开头，跳过'(',扫描表达式和右括号
+            scan(&Token);
+            n = binexpr(0);
+            rparen();
+            return n;
+        case T_SUB:
+            scan(&Token);
+            tree = primary();
+            tree->rvalue = 1;
+            left = mkastleaf(A_INT, 0);
+            n = mkastnode(A_SUB, left, NULL, tree, 0);
+            reject_token(&Token);
+            break;
+        case T_ADD:
+            scan(&Token);
+            tree = primary();
+            tree->rvalue = 1;
+            left = mkastleaf(A_INT, 0);
+            n = mkastnode(A_ADD, left, NULL, tree, 0);
+            reject_token(&Token);
+            break;
+        case T_LOGNOT:
+            scan(&Token);
+            tree = primary();
+            tree->rvalue = 1;
+            n = mkastnode(A_LOGNOT, NULL, NULL, tree, 0);
+            reject_token(&Token);
+            break;
+        // case T_RBRACE:
+        //     break;
+        default:
+        {
+            printf("111\n");
+            fprintf(stderr, "syntax error, token %d on line %d\n", Token.token, Line);
+            exit(13);
+        }
+    }
+    // 扫描下一个单词,并返回左节点
+    scan(&Token);
+    return n;
+}
+
+// 将单词转换为AST操作
+int token_op(int tokentype)
+{
+    if(tokentype > T_EOF && tokentype < T_INT)
+    {
+        return tokentype;
+    }
+    fprintf(stderr, "unknown token in token_op() on line %d\n", Line);
+    exit(14);
+}
+
+// 如果标记是右结合的，则返回1，否则返回0
+int rightassoc(int tokentype)
+{
+    if (tokentype == T_EQU)
+        return 1;
+    return 0;
+}
+
+// 每个AST节点的运算符优先级
+int OpPrec[] = {0, 10, 20, 30, 40, 40, 80, 80, 80, 80, 90, 90, 100, 100, 100, 110};
+
+// 若是一个二元运算符，返回它的优先级，否则报错
+int op_precedence(int tokentype)
+{
+    int prec = OpPrec[tokentype];
+    if (prec == 0)
+    {
+        fprintf(stderr, "syntax error on line %d, token %d\n", Line, tokentype);
+        exit(15);
+    }
+    return prec;
+}
+
+// 返回一个以二元操作符为根的树
+struct ASTnode *binexpr(int pretokentype)
+{
+    struct ASTnode *left, *right;
+    struct ASTnode *ltemp;
+    int ASTop, tokentype;
+
+    // 获取左节点的整数，同时获取下一个单词
+    left = primary();
+    // 如果下一个单词是';'或者')'或者']'，则返回左节点
+    tokentype = Token.token;
+    
+    if (tokentype == T_SEM || tokentype == T_RPAREN || tokentype == T_RBRACKET || tokentype == T_COMMA || tokentype == T_RBRACE || tokentype == T_RBRACKET)
+    {
+        left->rvalue = 1;
+        return left;
+    }
+    // 当前单词的优先级高于前一个单词的优先级
+    while (op_precedence(tokentype) > pretokentype || (rightassoc(tokentype) && op_precedence(tokentype) == pretokentype))
+    {
+        // 获取下一个单词
+        scan(&Token);
+
+        // 根据优先级递归生成右子树
+        right = binexpr(OpPrec[tokentype]);
+        // 确定要对子树执行的操作
+        ASTop = token_op(tokentype);
+
+        if (ASTop == A_ASSIGN)
+        {
+            // 赋值操作,把右边的树变成右值
+            right->rvalue= 1;
+
+            // 生成一个赋值AST树。但是，左右子树交换，
+            // 这样右表达式的代码将在左表达式之前生成
+            ltemp = left; left = right; right = ltemp;
+        }
+        else
+        {
+            // 我们没有做赋值，所以两棵树都应该是右值
+            // 如果它们是左值树，则将它们转换为右值
+            left->rvalue = 1;
+            right->rvalue = 1;
+        }
+        
+        if((token_op(tokentype) == A_LOGAND || token_op(tokentype) == A_LOGOR))
+        {
+            if(left->op == A_IDENT)
+            {
+                struct ASTnode *t;
+                t = mkastleaf(A_INT, 0);
+                left = mkastnode(A_NE, left, NULL, t, 0);
+            }
+            if(right->op == A_IDENT)
+            {
+                struct ASTnode *t;
+                t = mkastleaf(A_INT, 0);
+                right = mkastnode(A_NE, right, NULL, t, 0);
+            }
+        }
+
+        // 从单词类型得到到节点类型，然后合并左、右子树
+        if(token_op(tokentype) != A_LOGNOT)
+        {
+            left = mkastnode(token_op(tokentype), left, NULL, right, 0);
+        }
+        else
+        {
+            left = mkastnode(token_op(tokentype), NULL, NULL, right, 0);
+        }
+
+        // 更新当前单词的详细信息
+        tokentype = Token.token;
+
+        // 如果遇到';'或者')'或者']'，则返回左节点
+        // 此时的左节点已经更新为合并后的树的根节点
+        if (tokentype == T_SEM || tokentype == T_RPAREN || tokentype == T_RBRACKET || tokentype == T_COMMA || tokentype == T_RBRACE || tokentype == T_RBRACKET)
+        {
+            left->rvalue = 1;
+            return left;
+        }
+    }
+    left->rvalue = 1;
+    return left;
+}
+
+// 计算AST节点树的值
+long long cal_value(struct ASTnode *n)
+{
+    long long leftreg = 0, rightreg = 0;
+    // 一般AST节点处理
+    // 获取左右子树值
+    if (n->left)    leftreg = cal_value(n->left);
+    if (n->right)   rightreg = cal_value(n->right);
+    switch (n->op)
+    {
+        case A_ADD:    return leftreg + rightreg;
+        case A_SUB:    return leftreg - rightreg;
+        case A_MUL:    return leftreg * rightreg;
+        case A_DIV:    return leftreg / rightreg;
+        case A_MOD:    return leftreg % rightreg;
+        case A_INT:    return (int)(n->v.intvalue);
+        case A_IDENT:  return (int)(*Tsym[n->v.id].value);
+        case A_ADDRESS: return (long long)Tsym[n->v.id].value;
+        case A_LOGADD: rightreg = rightreg < 0 ? 0 : rightreg;
+                       return (long long)(*((int *)leftreg + (int)rightreg));
+        case A_ARRYADD: return (long long)((int *)leftreg + (int)rightreg);
+        case A_NULL: return NOREG;
+        case A_FUNCTIONCALL: return 0;
+        case A_GLUE: return leftreg + rightreg;
+        default:
+        {
+            fprintf(stderr, "Unknown AST operator %d\n", n->op);
+            exit(16);
+        }
+    }
+}
+
+// cg.c
+
+// 下一个局部变量相对于堆栈基指针的位置,
+// 将偏移量存储为正数，
+// 以便更容易地对齐堆栈指针
+int localOffset;
+int stackOffset;
+
+// 解析新函数时重置新局部变量的位置
+void arm_reset_locals()
+{
+    localOffset = 0;
+}
+
+// 获取下一个局部变量的位置
+int arm_get_localoffset(int type, int size)
+{
+    // 现在只需将偏移量减少至少4个字节并在堆栈上分配
+    localOffset += size * 4;
+    return -localOffset;
+}
+
+// 可用寄存器列表及其名称
+int freereg[12];
+// char *reglist[12]= {"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"};
+
+// 将所有寄存器设置为可用
+void arm_freeall_registers()
+{
+    memset(freereg, 1, sizeof(freereg));
+}
+
+// 分配一个空闲的寄存器，返回寄存器的编号。 
+// 如果没有可用的寄存器，则结束。
+int arm_alloc_register()
+{
+    for (int i = 4; i < 12; i++)
+    {
+        if (freereg[i])
+        {
+            freereg[i]= 0;
+            return i;
+        }
+    }
+    fprintf(stderr, "Out of registers!\n");
+    exit(17);
+}
+
+// 检查寄存器是否已经存在，
+// 若存在，则释放；否则，报错。
+void arm_free_register(int reg)
+{
+    if (freereg[reg] != 0 && reg > 3)
+    {
+        fprintf(stderr, "Error trying to free register %d\n", reg);
+        exit(18);
+    }
+    freereg[reg]= 1;
+}
+
+void literal(int u)
+{
+    outLine += u;
+    if(outLine > 900)
+    {
+        int i = label();
+        fprintf(Outfile, "\tb\tL%d\n\t.ltorg\nL%d:\n", i, i);
+        outLine = 0;
+    }
+}
+
+// 从.L3标签确定大整数的偏移量,
+// 如果整数不在列表中，则添加它
+void set_int_offset(int val)
+{
+    int offset = -1;
+    // 检查它是否已经存在
+    for (int i = 0; i < Intslot; i++)
+    {
+        if (Intlist[i] == val)
+        {
+            offset = 4 * i;
+            break;
+        }
+    }
+    // 不在列表中，将它加入列表
+    if (offset == -1)
+    {
+        offset = 4 * Intslot;
+        if (Intslot == MAXINTS)
+        {
+            fprintf(stderr, "Out of int slots in set_int_offset() on line %d\n", Line);
+            exit(19);
+        }
+        Intlist[Intslot++] = val;
+    }
+    // 从偏移地址载入数据到r3
+    fprintf(Outfile, "\tldr\tr3, =.L3+%d\n\tldr\tr3, [r3]\n", offset + 4);
+    literal(2);
+}
+
+// 将立即数加载到寄存器中，返回寄存器编号
+int arm_load_int(int value)
+{
+    // 获得新的寄存器
+    int r = arm_alloc_register();
+    // // 小数字用MOV，大数字用LDR操作
+    // if (value <= 2000)
+    // {
+    //     fprintf(Outfile, "\tmov\tr%d, #%d\n", r, value);
+    // }
+    // else
+    // {
+    //     set_int_offset(value);
+    //     fprintf(Outfile, "\tmov\tr%d, r3\n", r);
+    // }
+    fprintf(Outfile, "\tldr\tr%d, =#%d\n", r, value);
+    // if (value <= 65535)
+    // {
+    //     fprintf(Outfile, "\tmov\tr%d, #%d\n", r, value);
+    // }
+    // else
+    // {
+    //     fprintf(Outfile, "\tmov\tr%d, #%d\n", r, value % 65536);
+    //     fprintf(Outfile, "\tmovt\tr%d, #%d\n", r, value >> 16);
+    // }
+    literal(1);
+    return r;
+}
+
+// 确定变量与.L2标签的偏移量
+void set_varglobal_offset(int id)
+{
+    int offset = 0;
+    for (int i = 0; i < id; i++)
+    {
+        if ((Tsym[i].stype == S_VARIABLE || Tsym[i].stype == S_ARRAY) && Tsym[i].gl_class == C_GLOBAL) offset += 4;
+    }
+    fprintf(Outfile, "\tldr\tr3, =.L2+%d\n\tldr\tr3, [r3]\n", offset);
+    literal(2);
+}
+
+// 将变量中的值加载到寄存器中，并返回寄存器编号
+int arm_load_global(int id, int address)
+{
+    // 获得一个新的寄存器
+    int r = arm_alloc_register();
+    // 获得变量偏移地址
+    set_varglobal_offset(id);
+    fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
+    literal(1);
+    return r;
+}
+
+// 确定变量与堆栈基址指针的偏移量
+void set_varlocal_offset(int id)
+{
+    if (Tsym[id].posn >= 0)
+    {
+        int t = Tsym[id].posn + 4;
+        if(t > 2000)
+        {
+            int r = arm_load_int(t);
+            fprintf(Outfile, "\tadd\tr3, fp, r%d\n", r);
+            arm_free_register(r);
+        }
+        else
+        {
+            fprintf(Outfile, "\tadd\tr3, fp, #%d\n", t);
+        }
+    }
+    else
+    {
+        int t = Tsym[id].posn * -1 + 4;
+        if(t > 2000)
+        {
+            int r = arm_load_int(t);
+            fprintf(Outfile, "\tsub\tr3, fp, r%d\n", r);
+            arm_free_register(r);
+        }
+        else
+        {
+            fprintf(Outfile, "\tsub\tr3, fp, #%d\n", t);
+        }
+    }
+    literal(1);
+}
+
+// // 将变量中的值加载到寄存器中，并返回寄存器编号
+// int arm_load_local(int id)
+// {
+//     // 获得一个新的寄存器
+//     int r = arm_alloc_register();
+//     // 获得变量偏移地址
+//     set_varlocal_offset(id);
+//     fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
+//     return r;
+// }
+
+// 将变量中的值加载到寄存器中，并返回寄存器编号
+int arm_load_var(int id, int address)
+{
+    // 获得一个新的寄存器
+    int r = arm_alloc_register();
+    // 获得变量偏移地址
+    if(Tsym[id].gl_class == C_GLOBAL)
+    {
+        set_varglobal_offset(id);
+    }
+    else if(Tsym[id].gl_class == C_LOCAL || Tsym[id].gl_class == C_PARAM)
+    {
+        set_varlocal_offset(id);
+    }
+    else
+    {
+        fprintf(stderr, "Bad function type in arm_load_var() on line %d\n", Line);
+        exit(20);
+    }
+    fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
+    literal(1);
+    return r;
+}
+
+// 将两个寄存器相加并返回带有结果的寄存器编号
+int arm_add(int r1, int r2)
+{
+    fprintf(Outfile, "\tadd\tr%d, r%d, r%d\n", r1, r1, r2);
+    arm_free_register(r2);
+    literal(1);
+    return r1;
+}
+
+// 第一个寄存器减去第二个寄存器并返回带有结果的寄存器编号
+int arm_sub(int r1, int r2)
+{
+    fprintf(Outfile, "\tsub\tr%d, r%d, r%d\n", r1, r1, r2);
+    arm_free_register(r2);
+    literal(1);
+    return r1;
+}
+
+// 将两个寄存器相乘并返回带有结果的寄存器编号
+int arm_mul(int r1, int r2)
+{
+    fprintf(Outfile, "\tmul\tr%d, r%d, r%d\n", r1, r1, r2);
+    arm_free_register(r2);
+    literal(1);
+    return r1;
+}
+
+// 第一个寄存器除以第二个寄存器并返回带有结果的寄存器编号
+int arm_div(int r1, int r2)
+{
+    fprintf(Outfile, "\tmov\tr0, r%d\n", r1);
+    fprintf(Outfile, "\tmov\tr1, r%d\n", r2);
+    fprintf(Outfile, "\tbl\t__aeabi_idiv\n");
+    fprintf(Outfile, "\tmov\tr%d, r0\n", r1);
+    arm_free_register(r2);
+    literal(4);
+    return r1;
+}
+
+// 第一个寄存器除以第二个得到余数并返回带有结果的寄存器编号
+int arm_mod(int r1, int r2)
+{
+    // r1 % r2 = r1 - (r1 / r2) * r2
+    // 获得新的寄存器,保存r1
+    fprintf(Outfile, "\tmov\tr0, r%d\n", r1);
+    fprintf(Outfile, "\tmov\tr1, r%d\n", r2);
+    fprintf(Outfile, "\tbl\t__aeabi_idivmod\n");
+    fprintf(Outfile, "\tmov\tr%d, r1\n", r1);
+    arm_free_register(r2);
+    literal(4);
+    return r1;
+}
+
+// 比较指令表,即mov指令的条件 
+// AST类型顺序: A_EQ, A_NE, A_LT, A_GT, A_LE, A_GE
+char *cmplist1[] ={"eq", "ne", "lt", "gt", "le", "ge"};
+char *cmplist2[] ={"ne", "eq", "ge", "le", "gt", "lt"};
+
+// 比较两个寄存器并设置寄存器值
+int arm_compare_and_set(int ASTop, int r1, int r2)
+{
+    if(ASTop < A_EQ || ASTop > A_GE)
+    {
+        fprintf(stderr, "Bad ASTop in arm_compare_and_set() on line %d", Line);
+        exit(21);
+    }
+    fprintf(Outfile, "\tcmp\tr%d, r%d\n", r1, r2);
+    fprintf(Outfile, "\tmov%s\tr%d, #1\n", cmplist1[ASTop - A_EQ], r1);
+    fprintf(Outfile, "\tmov%s\tr%d, #0\n", cmplist2[ASTop - A_EQ], r1);
+    fprintf(Outfile, "\tuxtb\tr%d, r%d\n", r1, r1);
+    arm_free_register(r2);
+    literal(4);
+    return r1;
+}
+
+// 倒置跳转指令,即b指令的条件
+// AST类型顺序: A_EQ, A_NE, A_LT, A_GT, A_LE, A_GE
+char *invcmplist[] = { "ne", "eq", "ge", "le", "gt", "lt" };
+
+// 比较寄存器如果为假则跳转
+int arm_compare_and_jump(int ASTop, int r1, int r2, int label)
+{
+    if (ASTop < A_EQ || ASTop > A_GE)
+    {
+        fprintf(stderr, "Bad ASTop in arm_compare_and_jump() on line %d", Line);
+        exit(22);
+    }
+    fprintf(Outfile, "\tcmp\tr%d, r%d\n", r1, r2);
+    fprintf(Outfile, "\tb%s\tL%d\n", invcmplist[ASTop - A_EQ], label);
+    // arm_freeall_registers();
+    arm_free_register(r1);
+    arm_free_register(r2);
+    literal(2);
+    return NOREG;
+}
+
+// 生成标签
+void arm_label(int l)
+{
+    fprintf(Outfile, "L%d:\n", l);
+    literal(1);
+}
+
+// 跳转到指定标签
+void arm_jump(int l)
+{
+    fprintf(Outfile, "\tb\tL%d\n", l);
+    literal(1);
+}
+
+// 生成代码将标识符的地址加载到寄存器中并返回
+int arm_address(int id, int address)
+{
+    int r = arm_alloc_register();
+    // 获得变量偏移地址
+    if(Tsym[id].gl_class == C_GLOBAL)
+    {
+        set_varglobal_offset(id);
+    }
+    else if(Tsym[id].gl_class == C_LOCAL || Tsym[id].gl_class == C_PARAM)
+    {
+        set_varlocal_offset(id);
+    }
+    else
+    {
+        fprintf(stderr, "Bad function type in arm_address() on line %d\n", Line);
+        exit(23);
+    }
+    fprintf(Outfile, "\tmov\tr%d, r3\n", r);
+    literal(1);
+    return r;
+}
+
+// 生成以下代码,
+// 如果为右值,将寄存器中首地址和偏移地址
+// 生成逻辑地址的值并返回;如果为左值,
+// 将逻辑地址的值加载到寄存器中并返回
+int arm_load_address(int l, int r, int flag)
+{
+    fprintf(Outfile, "\tlsl\tr%d, r%d, #2\n", r, r);
+    fprintf(Outfile, "\tadd\tr%d, r%d, r%d\n", r, l, r);
+    arm_free_register(l);
+    if(flag)
+    {
+        fprintf(Outfile, "\tldr\tr%d, [r%d]\n", r, r);
+        literal(3);
+    }
+    else
+    {
+        literal(2);
+    }
+    return r;
+}
+
+// 生成代码把寄存器中的值写入地址
+int arm_stor_address(int l, int r)
+{
+    fprintf(Outfile, "\tstr\tr%d, [r%d]\n", l, r);
+    arm_free_register(r);
+    arm_free_register(l);
+    literal(1);
+    return NOREG;
+}
+
+// 打印寄存器值
+void arm_print_reg(int reg)
+{
+    fprintf(Outfile, "\tmov     r1, r%d\n", reg);
+    fputs(
+        "\tldr     r0, =.L3\n"
+        "\tldr     r0, [r0]\n"
+        "\tbl      printf\n",
+    Outfile);
+    literal(4);
+    arm_free_register(reg);
+}
+
+// 储存函数前四位参数的寄存器号
+int temp_param[5];
+
+void arm_save_register(int num_args)
+{
+    char save_reg[100] = "";
+    for (int i = 4; i < 12; i++)
+    {
+        if(!freereg[i])
+        {
+            sprintf(save_reg, "%sr%d, ", save_reg, i);
+        }
+    }
+    int len = strlen(save_reg);
+    if(len)
+    {
+        save_reg[len - 2] = '\0';
+        fprintf(Outfile, "\tpush\t{%s}\n", save_reg);
+        literal(1);
+    }
+    if(num_args > 4)
+    {
+        fprintf(Outfile, "\tsub\tsp, #%d\n", (num_args - 4) * 4);
+        literal(1);
+    }
+}
+
+// 使用给定寄存器中的一个参数调用函数,返回带有结果的寄存器
+int arm_call(int id, int num_args)
+{
+    for (int i = 0; i < (min(num_args, 4)); i++)
+    {
+        fprintf(Outfile, "\tmov\tr%d, r%d\n", i, temp_param[i + 1]);
+        arm_free_register(temp_param[i + 1]);
+        literal(1);
+    }
+    char save_reg[100] = "";
+    for (int i = 4; i < 12; i++)
+    {
+        if(!freereg[i])
+        {
+            sprintf(save_reg, "%sr%d, ", save_reg, i);
+        }
+    }
+    int len = strlen(save_reg);
+    fprintf(Outfile, "\tbl\t%s\n", Tsym[id].name);
+    literal(1);
+    if(num_args > 4)
+    {
+        fprintf(Outfile, "\tadd\tsp, #%d\n", (num_args - 4) * 4);
+        literal(1);
+    }
+    if(len)
+    {
+        save_reg[len - 2] = '\0';
+        fprintf(Outfile, "\tpop\t{%s}\n", save_reg);
+        literal(1);
+    }
+    int r = arm_alloc_register();
+    fprintf(Outfile, "\tmov\tr%d, r0\n", r);
+    literal(1);
+    return r;
+}
+
+// 给定一个带有参数值的寄存器,
+// 将此参数复制到第argposn个参数中。
+// 请注意,argposn是1, 2, 3, 4,...,从不为零
+void arm_copy_arg(int r, int argposn)
+{
+    if(argposn <= 4)
+    {
+        temp_param[argposn] = r;
+    }
+    else
+    {
+        if((argposn - 5) * 4 > -2000)
+        {
+            fprintf(Outfile, "\tstr\tr%d, [sp, #%d]\n", r, (argposn - 5) * 4);
+            literal(1);
+        }
+        else
+        {
+            int l = arm_load_int((argposn - 5) * 4);
+            fprintf(Outfile, "\tstr\tr%d, [sp, r%d]\n", r, l);
+            arm_free_register(l);
+            literal(1);
+        }
+        arm_free_register(r);
+    }
+}
+
+// 将寄存器的值装载入变量
+int arm_stor_var(int r, int id, int address)
+{
+    // 获得变量偏移地址
+    if(Tsym[id].gl_class == C_GLOBAL)
+    {
+        set_varglobal_offset(id);
+    }
+    else if(Tsym[id].gl_class == C_LOCAL)
+    {
+        set_varlocal_offset(id);
+    }
+    else if(Tsym[id].gl_class == C_PARAM)
+    {
+        set_varlocal_offset(id);
+    }
+    else
+    {
+        fprintf(stderr, "Bad function type in arm_stor_var() on line %d\n", Line);
+        exit(24);
+    }
+    fprintf(Outfile, "\tstr\tr%d, [r3]\n", r);
+    arm_free_register(r);
+    literal(1);
+    return NOREG;
+}
+
+// 生成全局变量符号表
+void arm_global_sym(int id)
+{
+    fprintf(Outfile, "\t.text\n\t.comm\t%s,%d,4\n", Tsym[id].name, 4 * Tsym[id].size);
+    literal(2);
+}
+
+// 生成全局变量符号表,且赋初始值
+void arm_global_symassign(int id)
+{
+    fprintf(Outfile, "\t.text\n\t.global %s\n\t.data\n\t.align  2\n\t.type   %s, %%object\n\t.size   %s, %d\n%s:\n", Tsym[id].name, Tsym[id].name, Tsym[id].name, Tsym[id].size * 4, Tsym[id].name);
+    literal(7);
+    int number = 0;
+    for(int i = 0;i < Tsym[id].size;i++)
+    {
+        if(Tsym[id].value[i] != 0)
+        {
+            if(number > 0)
+            {
+                fprintf(Outfile,"\t.space   %d\n", number * 4);
+                number = 0;
+                literal(1);
+            }
+            fprintf(Outfile,"\t.word   %d\n",Tsym[id].value[i]);
+            literal(1);
+        }
+        else
+        {
+            number++;
+        }
+    }
+    if(number > 0)
+    {
+        fprintf(Outfile,"\t.space   %d\n", number * 4);
+        literal(1);
+        number = 0;
+    }
+}
+
+// 生成return语句代码
+void arm_return(int reg, int id)
+{
+    if(Tsym[id].type == P_INT)
+    {
+        fprintf(Outfile, "\tmov\tr0, r%d\n", reg);
+        arm_free_register(reg);
+        literal(1);
+        arm_jump(Tsym[id].endlabel);
+    }
+    else if(reg == -1)
+    {
+        arm_jump(Tsym[id].endlabel);
+    }
+    else
+    {
+        fprintf(stderr, "Bad function type in arm_return():%d on line %d\n", Tsym[id].type, Line);
+        exit(25);
+    }
+}
+
+// 汇编预处理代码
+void arm_preamble()
+{
+    arm_freeall_registers();
+    fputs(
+        "\t.text\n"
+        "\t.global __aeabi_idiv\n"
+        "\t.section\t.rodata\n"
+        "\t.align  2\n"
+        ".LC0:\n"
+        "\t.ascii  \"%d\\012\\000\"\n",
+    Outfile);
+    literal(6);
+}
+
+// 生成函数前言
+void arm_function_preamble(char *name, int varlocalnum)
+{
+    int uparam_num = use_param_num > 4 ? use_param_num - 4 : 0;
+    stackOffset = 0;
+    for(int i = SYMBOL_NUM - 1;i > Locals;i--)
+    {
+        stackOffset += Tsym[i].size;
+    }
+    stackOffset = (stackOffset + uparam_num) * 4;
+    fprintf(Outfile,
+        "\t.text\n"
+        "\t.align  2\n"
+        "\t.globl\t%s\n"
+        "\t.type\t%s, %%function\n"
+        "%s:\n"
+        "\tpush    {fp, lr}\n"
+        "\tadd     fp, sp, #4\n", name, name, name);
+    literal(7);
+    if(stackOffset > 2000)
+    {
+        int l = arm_load_int(stackOffset);
+        fprintf(Outfile, "\tsub\tsp, sp, r%d\n", l);
+        arm_free_register(l);
+        literal(1);
+    }
+    else
+    {
+        fprintf(Outfile, "\tsub\tsp, sp, #%d\n", stackOffset);
+        literal(1);
+    }
+    int hparam_num = have_param_num > 4 ? 4 : have_param_num;
+    for (int i = 0; i < hparam_num; i++)
+    {
+        fprintf(Outfile, "\tstr     r%d, [fp, #%d]\n", i, -8 - 4 * i);
+        literal(1);
+    }
+}
+
+// 生成函数结尾
+void arm_function_postamble(int id)
+{
+    arm_label(Tsym[id].endlabel);
+    fputs("\tsub\tsp, fp, #4\n" "\tpop\t{fp, pc}\n\t.ltorg\n" "\t.align\t2\n", Outfile);
+    outLine = 0;
+}
+
+// 汇编尾代码
+void arm_postamble()
+{
+    // 打印大整数
+    fputs(
+        ".L3:\n"
+        "\t.word   .LC0\n",
+    Outfile);
+    literal(2);
+    for (int i = 0; i < Intslot; i++)
+    {
+        fprintf(Outfile, "\t.word   %d\n", Intlist[i]);
+        literal(1);
+    }
+    // 打印全局变量
+    fprintf(Outfile, ".L2:\n");
+    literal(1);
+    for (int i = 0; i < Globals; i++)
+    {
+        if (Tsym[i].stype != S_FUNCTION && Tsym[i].gl_class == C_GLOBAL)
+        {
+            fprintf(Outfile, "\t.word   %s\n", Tsym[i].name);
+            literal(1);
+        }
+    }
+}
+
+// gen.c
+
+// 生成并返回一个新的标签号
+int label()
+{
+    static int id = 1;
+    return id++;
+}
+
+// 逻辑关系符号取反
+int operator_negate(int op, struct ASTnode *tree)
+{
+    switch (op)
+    {
+        case A_EQ: return A_NE;
+        case A_NE: return A_EQ;
+        case A_LT: return A_GE;
+        case A_GT: return A_LE;
+        case A_LE: return A_GT;
+        case A_GE: return A_LT;
+        case A_LOGAND:  tree->left->op = operator_negate(tree->left->op, tree->left);
+                        tree->right->op = operator_negate(tree->right->op, tree->right);
+                        return A_LOGOR;
+        case A_LOGOR:   tree->left->op = operator_negate(tree->left->op, tree->left);
+                        tree->right->op = operator_negate(tree->right->op, tree->right);
+                        return A_LOGAND;
+        default:   fprintf(stderr, "error operator:%d on line %d\n", op, Line);
+                   exit(26);
+    }
+    return -1;
+}
+
+// 为IF语句和可选的ELSE子句生成代码
+int code_IF_generator(struct ASTnode *n, int loopstartlabel, int loopendlabel)
+{
+    // 生成两个标签：一个用于错误的复合语句，
+    // 一个用于整个IF语句的结尾。 
+    // 当没有 ELSE 子句时，Lfalse就是结束标签
+    int Ltrue, Lfalse, Lend;
+    Ltrue = label();
+    Lfalse = label();
+    if (n->right) Lend = label();
+    // 生成条件代码，然后零跳转到错误标签。
+    // 我们通过发送Ltrue, Lfalse标签作为寄存器
+    code_generator(n->left, Lfalse, Ltrue, NOLABEL, NOLABEL, n->op);
+    arm_freeall_registers();
+    // 生成为真的复合语句代码
+    arm_label(Ltrue);
+    code_generator(n->mid, Ltrue, Lfalse, loopstartlabel, loopendlabel,n->op);
+    arm_freeall_registers();
+    // 如果有可选的ELSE子句，则生成跳转到最后
+    if (n->right) arm_jump(Lend);
+    arm_label(Lfalse);
+    // 可选的ELSE子句：生成为假的复合语句和结束标签
+    if (n->right)
+    {
+        code_generator(n->right, NOLABEL, NOLABEL, loopstartlabel, loopendlabel,n->op);
+        arm_freeall_registers();
+        arm_label(Lend);
+    }
+    return NOREG;
+}
+
+// 为WHILE语句和可选的ELSE子句生成代码
+int code_WHILE_generator(struct ASTnode *n)
+{
+    int Lstart, Lend, Lcodes;
+    // 生成Lstart、Lend标签，
+    // 输出Lstart标签
+    Lstart = label();
+    Lend = label();
+    Lcodes = label();
+    arm_label(Lstart);
+    // 生成条件代码，然后跳转到结束标签,
+    // 传送Lend标签作为寄存器
+    code_generator(n->left, Lend, Lcodes, Lstart, Lend, n->op);
+    arm_freeall_registers();
+    arm_label(Lcodes);
+    // 生成语句块
+    code_generator(n->right, NOLABEL, NOLABEL, Lstart, Lend, n->op);
+    arm_freeall_registers();
+    // 输出跳转到Lstart标签，
+    // 输出Lend标签
+    arm_jump(Lstart);
+    arm_label(Lend);
+    return NOREG;
+}
+
+int code_funcall_generator(struct ASTnode *n)
+{
+    struct ASTnode *gluetree = n->left;
+    int reg;
+    int numargs = gluetree != NULL ? gluetree->v.size : 0;
+    // 如果有参数列表，
+    // 则从左到右遍历该列表
+    // 保存寄存器
+    arm_save_register(numargs);
+    while (gluetree)
+    {
+        // 计算表达式值
+        reg = code_generator(gluetree->right, NOLABEL, NOLABEL, NOLABEL, NOLABEL, gluetree->op);
+        // 复制到第n个参数
+        arm_copy_arg(reg, gluetree->v.size);
+        // 保留第一个（最多）数量的参数
+        if (numargs==0) numargs= gluetree->v.size;
+        gluetree = gluetree->left;
+    }
+    // arm_freeall_registers();
+    return arm_call(n->v.id, numargs);
+}
+
+// 给定一个 AST、一个可选标签和父级的AST操作，
+// 递归生成汇编代码,返回带有树的最终值的寄存器id
+int code_generator(struct ASTnode *n, int ifflase, int iftrue, int loopstartlabel, int loopendlabel, int parentASTop)
+{
+    int leftreg = -1, rightreg = -1, flabel = -1;
+    if(!n) return NOREG;
+    // 特定的AST节点处理
+    switch (n->op)
+    {
+        case A_IF:       return code_IF_generator(n, loopstartlabel, loopendlabel);
+        case A_WHILE:    return code_WHILE_generator(n);
+        // 执行每个子语句，并在每个子语句执行之后释放寄存器
+        case A_GLUE:     code_generator(n->left, ifflase, iftrue, loopstartlabel, loopendlabel, n->op);
+                         arm_freeall_registers();
+                         code_generator(n->right, ifflase, iftrue, loopstartlabel, loopendlabel, n->op);
+                         arm_freeall_registers();
+                         return NOREG;
+        // 在生成主体代码之前生成函数的前言
+        case A_FUNCTION: arm_function_preamble(Tsym[n->v.id].name, Locals);
+                         code_generator(n->left, NOLABEL, NOLABEL, NOLABEL, NOLABEL, n->op);
+                         arm_function_postamble(n->v.id);
+                         return NOREG;
+        case A_FUNCTIONCALL:
+                         return code_funcall_generator(n);
+        case A_LOGAND:  code_generator(n->left, ifflase, iftrue, loopstartlabel, loopendlabel, parentASTop);
+                        code_generator(n->right, ifflase, iftrue, loopstartlabel, loopendlabel, parentASTop);
+                        return NOREG;
+        case A_LOGOR:   if(n->left->op == A_LOGAND)
+                        {
+                            flabel = label();
+                            code_generator(n->left, flabel, iftrue, NOLABEL, NOLABEL, parentASTop);
+                            arm_jump(iftrue);
+                        }
+                        else if(n->left->op == A_LOGOR)
+                        {
+                            flabel = label();
+                            code_generator(n->left, flabel, iftrue, NOLABEL, NOLABEL, parentASTop);
+                            arm_jump(iftrue);
+                        }
+                        else if(n->left->op == A_LOGNOT)
+                        {
+                            flabel = label();
+                            code_generator(n->left, iftrue, flabel, NOLABEL, NOLABEL, parentASTop);
+                        }
+                        else
+                        {
+                            // 逻辑操作取反，并跳转到Ltrue标签
+                            n->left->op = operator_negate(n->left->op, n->left);
+                            code_generator(n->left, iftrue, ifflase, NOLABEL, NOLABEL, parentASTop);
+                        }
+                        if(flabel != -1)
+                        {
+                            arm_label(flabel);
+                        }
+                         code_generator(n->right, ifflase, iftrue, NOLABEL, NOLABEL, parentASTop);
+                         return NOREG;
+        case A_LOGNOT:   // 逻辑操作取反，继续执行操作
+                         if(n->right->op != A_LOGNOT)
+                         {
+                             n->right->op = operator_negate(n->right->op, n->right);
+                         }
+                         else
+                         {
+                             n = n->right;
+                         }
+                         return code_generator(n->right, ifflase, iftrue, loopstartlabel, loopendlabel, parentASTop);
+    }
+    // 一般AST节点处理
+    // 获取左右子树值
+    if (n->left)    leftreg = code_generator(n->left, NOLABEL, NOLABEL, NOLABEL, NOLABEL, n->op);
+    if (n->right)   rightreg = code_generator(n->right, NOLABEL, NOLABEL, NOLABEL, NOLABEL, n->op);
+    switch (n->op)
+    {
+        case A_ADD:    return (arm_add(leftreg, rightreg));
+        case A_SUB:    return (arm_sub(leftreg, rightreg));
+        case A_MUL:    return (arm_mul(leftreg, rightreg));
+        case A_DIV:    return (arm_div(leftreg, rightreg));
+        case A_MOD:    return (arm_mod(leftreg, rightreg));
+        case A_EQ:
+        case A_NE:
+        case A_LT:
+        case A_GT:
+        case A_LE:
+        case A_GE:
+            // 如果父AST节点是A_IF或WHILE，则生成一个比较后跟一个跳转。
+            // 否则，比较寄存器并根据比较结果将寄存器设置为1或0
+            if(parentASTop == A_IF || parentASTop == A_WHILE)
+                return arm_compare_and_jump(n->op, leftreg, rightreg, ifflase);
+            else return arm_compare_and_set(n->op, leftreg, rightreg);
+        case A_INT:    return arm_load_int(n->v.intvalue);
+        case A_IDENT:  // 如果标识符是右值，则加载它的值
+                       if (n->rvalue || parentASTop == A_ADDRESS) return arm_load_var(n->v.id, n->address);
+                       else return NOREG;
+        case A_ASSIGN: // 判断分配的标量变量还是数组变量
+                       switch (n->right->op)
+                       {
+                            case A_IDENT:  return arm_stor_var(leftreg, n->right->v.id, n->address);
+                            case A_LOGADD: return arm_stor_address(leftreg, rightreg);
+                            default:
+                                fprintf(stderr, "Can't A_ASSIGN in code_generator(), op:%d on line %d\n", n->op, Line);
+                                exit(27);
+                       }
+        case A_PRINT: arm_print_reg(leftreg);
+                      arm_freeall_registers();
+                      return NOREG;
+        case A_RETURN: arm_return(leftreg, Functionid);
+                       return NOREG;
+        case A_ADDRESS: return arm_address(n->v.id, n->address);
+        case A_LOGADD:  // 如果是右值,返回地址所在的值;如果是左值,返回逻辑地址给A_ASSIGN
+                        return arm_load_address(leftreg, rightreg, n->rvalue);
+        case A_ARRYADD: return arm_load_address(leftreg, rightreg, 0);
+        case A_BREAK: arm_jump(loopendlabel); return NOREG;
+        case A_CONTINUE: arm_jump(loopstartlabel); return NOREG;
+        case A_NULL: return NOREG;
+        default:
+        {   
+            fprintf(stderr, "Unknown AST operator %d\n", n->op);
+            exit(28);
+        }
+    }
+}
+
+// misc.c
+
+// 检查当前单词是否为t，并获取下一个单词
+void match(int t, char *what)
+{
+    if (Token.token == t)
+    {
+        scan(&Token);
+    }
+    else
+    {
+        fprintf(stderr, "%s expected on line %d\n", what, Line);
+        exit(29);
+    }
+}
+
+// 检查当前单词是否为";"，并获得下一个单词
+void semi()
+{
+    match(T_SEM, ";");
+}
+
+// 检查当前单词是否为标识符，并获取下一个单词
+void ident()
+{
+    match(T_IDENT, "identifier");
+}
+
+// 检查当前单词是否为"{"，并获取下一个单词
+void lbrace()
+{
+    match(T_LBRACE, "{");
+}
+
+// 检查当前单词是否为"}"，并获取下一个单词
+void rbrace()
+{
+    match(T_RBRACE, "}");
+}
+
+// 检查当前单词是否为"("，并获取下一个单词
+void lparen()
+{
+    match(T_LPAREN, "(");
+}
+
+// 检查当前单词是否为")"，并获取下一个单词
+void rparen()
+{
+    match(T_RPAREN, ")");
+}
+
+// decl.c
+
+// 解析当前单词并返回类型枚举值,同时扫描下一个单词
+int parse_type()
+{
+    int type;
+    switch (Token.token)
+    {
+        case T_VOID:   type = P_VOID; break;
+        case T_KEYINT: type = P_INT;  break;
+        default:
+        {
+            fprintf(stderr, "Illegal type, token:%d on line %d\n", Token.token, Line);
+            exit(30);
+        }
+    }
+    scan(&Token);
+    return type;
+}
+
+// 解析"{"
+struct ASTnode *arrat_equ(int *aix, int islocal, int length, int id, int ifconst)
+{
+    struct ASTnode * left = NULL, *right, *tree, *address;
+    int start = *aix;
+    while((*aix - start) < Tsym[id].offset[length])
+    {
+        if(Token.token == T_LBRACE)
+        {
+            int mod_num = (*aix - start) % Tsym[id].offset[length+1];
+            int tlength = mod_num > 0 ? Tsym[id].offset[length+1] - mod_num : 0;
+            for(int i = 0; i < tlength;i++)
+            {
+                if(islocal)
+                {
+                    address = mkastleaf(A_ADDRESS, id);
+                    right = mkastleaf(A_INT, *aix);
+                    right = mkastnode(A_LOGADD, address, NULL, right, 0);
+                    right->rvalue = 0;
+                    tree = mkastleaf(A_INT, 0);
+                    tree = mkastnode(A_ASSIGN, tree, NULL, right, 0);
+                    if (left == NULL)   left = tree;
+                    else    left = mkastnode(A_GLUE, left, NULL, tree, 0);
+                }
+                Tsym[id].value[(*aix)++] = 0;
+            }
+            scan(&Token);
+            tree = arrat_equ(aix, islocal, length+1, id, ifconst);
+            if (left == NULL)   left = tree;
+            else    left = mkastnode(A_GLUE, left, NULL, tree, 0); 
+        }
+        else if(Token.token == T_RBRACE)
+        {
+            int mod_num = (*aix - start) % Tsym[id].offset[length];
+            int tlength = mod_num > 0 ? Tsym[id].offset[length] - mod_num : (*aix == start ? Tsym[id].offset[length] : 0);
+            for(int i = 0; i < tlength;i++)
+            {
+                if(islocal)
+                {
+                    address = mkastleaf(A_ADDRESS, id);
+                    right = mkastleaf(A_INT, *aix);
+                    right = mkastnode(A_LOGADD, address, NULL, right, 0);
+                    right->rvalue = 0;
+                    tree = mkastleaf(A_INT, 0);
+                    tree = mkastnode(A_ASSIGN, tree, NULL, right, 0);
+                    if (left == NULL)   left = tree;
+                    else    left = mkastnode(A_GLUE, left, NULL, tree, 0);
+                }
+                Tsym[id].value[(*aix)++] = 0;
+            }
+            scan(&Token);
+            return left;
+        }
+        else if(Token.token == T_COMMA)
+        {scan(&Token);}
+        else
+        {
+            if(islocal)
+            {
+                address = mkastleaf(A_ADDRESS, id);
+                right = mkastleaf(A_INT, *aix);
+                right = mkastnode(A_LOGADD, address, NULL, right, 0);
+                right->rvalue = 0;
+                tree = binexpr(OpPrec[T_EQU]);
+                (*aix)++;
+                if(ifconst)
+                {
+                    Tsym[id].value[*aix] = cal_value(tree);
+                }
+                tree = mkastnode(A_ASSIGN, tree, NULL, right, 0);
+                if (left == NULL)   left = tree;
+                else    left = mkastnode(A_GLUE, left, NULL, tree, 0);
+            }
+            else
+            {
+                tree = binexpr(OpPrec[T_EQU]);
+                Tsym[id].value[(*aix)++] = cal_value(tree);
+            }
+        }
+    }
+    if(Token.token == T_RBRACE)
+    {
+        scan(&Token);
+    }
+    return left;
+}
+
+// 分析变量声明
+struct ASTnode *var_declaration(int type, int islocal, int isparam, int ifconst)
+{
+    struct ASTnode * left = NULL, *right, *tree = (struct ASTnode *)malloc(sizeof(struct ASTnode));
+    int id;
+    if(type != P_INT)
+    {
+        fprintf(stderr, "Error token != T_INT on line %d\n", Line);
+        exit(31);
+    }
+    while(1)
+    {
+        if(Token.token == T_CONST)
+        {
+            ifconst = 1;
+            scan(&Token);
+        }
+        // 现在是标识符，如果下一个标记是"["
+        if (Token.token == T_LBRACKET)
+        {
+            char tname[100];
+            strcpy(tname, Text);
+            if(islocal)
+            {
+                id = Locals;
+            }
+            else
+            {
+                id = Globals;
+            }
+            int arrstart = 0, arrnum = 0;
+            while(Token.token == T_LBRACKET)
+            {
+                // 跳过"["
+                scan(&Token);
+                // 获得数组的大小
+                tree = binexpr(OpPrec[T_EQU]);
+                int value = cal_value(tree);
+                for(int i = arrstart;i < arrnum;i++)
+                {
+                    Tsym[id].offset[i] *= value;
+                }
+                Tsym[id].offset[arrnum++] = value;
+                // 检查下一个"]"
+                match(T_RBRACKET, "]");
+            }
+            Tsym[id].offset[arrnum++] = 1;
+            Tsym[id].offset[arrnum] = -1;
+            free(Tsym[id].value);
+            Tsym[id].value = (int *)malloc(Tsym[id].offset[0] * sizeof(int));
+            // 将此添加为已知数组并在汇编中生成其空间
+            if (islocal)
+            {
+                id = add_local(tname, type, S_ARRAY, 0, Tsym[id].offset[0]);
+                if(Token.token == T_EQU)
+                {
+                    scan(&Token);
+                    match(T_LBRACE,"{");
+                    int axi_n = 0;
+                    tree = arrat_equ(&axi_n, islocal, 0, id, ifconst);
+                    if (left == NULL)   left = tree;
+                    else    left = mkastnode(A_GLUE, left, NULL, tree, 0);
+                }
+            }
+            else
+            {
+                id = add_global(tname, type, S_ARRAY, 0, Tsym[id].offset[0]);
+                if(Token.token == T_EQU)
+                {
+                    scan(&Token);
+                    match(T_LBRACE,"{");
+                    int axi_n = 0;
+                    arrat_equ(&axi_n, islocal, 0, id, ifconst);
+                    arm_global_symassign(id);
+                }
+                else
+                {
+                    arm_global_sym(id);
+                }
+            }
+        }
+        else
+        {
+            // 将其添加为已知标量并在汇编中生成其空间
+            if (islocal)
+            {
+                id = add_local(Text, type, S_VARIABLE, 0, 1);
+                // 如果下一个是"=",为变量赋初值
+                if(Token.token == T_EQU)
+                {
+                    scan(&Token);
+                    if(Token.token != T_INT && Token.token != T_IDENT && Token.token != T_SUB && Token.token != T_ADD && Token.token != T_LPAREN)
+                    {
+                        fprintf(stderr, "Error token != T_INT on line %d\n", Line);
+                        exit(32);
+                    }
+                    right = mkastleaf(A_IDENT, id);
+                    tree = binexpr(OpPrec[T_EQU]);
+                    if(ifconst)
+                    {
+                        *(Tsym[id].value) = cal_value(tree);
+                    }
+                    tree = mkastnode(A_ASSIGN, tree, NULL, right, 0);
+                    if (left == NULL)   left = tree;
+                    else    left = mkastnode(A_GLUE, left, NULL, tree, 0);
+                }
+            }
+            else
+            {
+                id = add_global(Text, type, S_VARIABLE, 0, 1);
+                // 如果下一个是"=",为变量赋初值
+                if(Token.token == T_EQU)
+                {
+                    scan(&Token);
+                    if(Token.token != T_INT && Token.token != T_SUB && Token.token != T_ADD)
+                    {
+                        fprintf(stderr, "Error token != T_INT on line %d\n", Line);
+                        exit(33);
+                    }
+                    tree = binexpr(OpPrec[T_EQU]);
+                    *(Tsym[id].value) = cal_value(tree);
+                    arm_global_symassign(id);
+                }
+                else
+                {
+                    arm_global_sym(id);
+                }
+            }
+        }
+        // 如果下一个单词是";",则返回
+        if(Token.token == T_SEM)
+        {
+            if(left == NULL || left->op != A_ASSIGN)
+            {
+                scan(&Token);
+            }
+            return left;
+        }
+        // 如果下一个是",",生成下一个变量
+        if(Token.token == T_COMMA)
+        {
+            scan(&Token);
+            ident();
+            continue;
+        }
+        fprintf(stderr, "Missing , or ; after identifier on line %d\n", Line);
+        exit(34);
+    }
+    return left;
+}
+
+// 解析函数名后括号中的参数,
+// 添加到符号表中并返回参数的数量
+int param_declaration()
+{
+    int type;
+    int paramcnt = 0;
+    struct ASTnode *tree;
+    advance_scope();
+    // 循环直到最后一个右括号
+    while (Token.token != T_RPAREN)
+    {
+        if(Token.token == T_CONST)
+        {
+            scan(&Token);
+        }
+        // 获取类型和标识符并将其添加到符号表中
+        type = parse_type();
+        ident();
+        int id;
+        if(type != P_INT)
+        {
+            fprintf(stderr, "Error token != T_INT on line %d\n", Line);
+            exit(35);
+        }
+        if(Token.token != T_LBRACKET)
+        {
+            id = add_local(Text, type, S_VARIABLE, 1, 1);
+        }
+        else
+        {
+            id = add_local(Text, type, S_ARRAY, 1, 1);
+            scan(&Token);
+            match(T_RBRACKET, "]");
+            Tsym[id].offset[0] = 1;
+            int arrstart = 0, arrnum = 1;
+            while(Token.token == T_LBRACKET)
+            {
+                // 跳过"["
+                scan(&Token);
+                // 获得数组的大小
+                tree = binexpr(OpPrec[T_EQU]);
+                int value = cal_value(tree);
+                for(int i = arrstart;i < arrnum;i++)
+                {
+                    Tsym[id].offset[i] *= value;
+                }
+                Tsym[id].offset[arrnum++] = value;
+                // 检查下一个"]"
+                match(T_RBRACKET, "]");
+            }
+            Tsym[id].offset[arrnum++] = 1;
+            Tsym[id].offset[arrnum] = -1;
+        }
+        paramcnt++;
+        // 匹配','或者')'
+        switch (Token.token)
+        {
+            case T_COMMA: scan(&Token); break;
+            case T_RPAREN: break;
+            default:
+            {
+                fprintf(stderr, "Unexpected token in parameter list:%d on line %d\n", Token.token, Line);
+                exit(36);
+            }
+        }
+    }
+    back_scope();
+    scope_num--;
+    // 返回参数数量
+    return paramcnt;
+}
+
+// 分析简单函数声明
+struct ASTnode *function_declaration(int type)
+{
+    struct ASTnode *tree, *finalstmt;
+    int nameslot, endlabel, paramcnt;
+    // 匹配'void'或'int'、函数名和'(' ')',
+    // 但不做任何处理
+    if (type != P_VOID && type != P_INT)
+    {
+        fprintf(stderr, "Void or int expected on line %d\n", Line);
+        exit(37);
+    }
+    // 获取结束标签的label-id,
+    // 将函数添加到符号表中,
+    // 将Functionid设置为函数的符号id
+    endlabel = label();
+    nameslot = add_global(Text, type, S_FUNCTION, endlabel, 0);
+    Functionid = nameslot;
+    use_param_num = 0;
+    have_param_num = 0;
+    arm_reset_locals(); // 重置局部变量的位置
+    lparen();
+    paramcnt = param_declaration();
+    Tsym[nameslot].posn = paramcnt;
+    rparen();
+    // 获得代码块的AST树
+    tree = Block_statement();
+    // 如果函数类型不是VOID,
+    // 检查语句块中的最后一个AST操作是否为return语句
+    // if (type != P_VOID)
+    // {
+    //     finalstmt = (tree->op == A_GLUE) ? tree->right : tree;
+    //     if (finalstmt == NULL || finalstmt->op != A_RETURN)
+    //     {
+    //         fprintf(stderr, "No return for function with non-void type on line %d\n", Line);
+    //         exit(1);
+    //     }
+    // }
+    // 返回具有函数符号位置和语句块子树的A_FUNCTION节点
+    return mkastunary(A_FUNCTION, tree, nameslot);
+}
+
+// 解析一个或多个全局变量或函数
+void global_declarations()
+{
+    struct ASTnode *tree = NULL;
+    int type, finaltoken;
+    while (1)
+    {
+        if (Token.token == T_CONST)
+        {
+            scan(&Token);
+        }
+        type = parse_type();
+        ident();
+        if (Token.token == T_LPAREN)
+        {
+            // 解析函数声明，并生成汇编代码
+            tree = function_declaration(type);
+            finaltoken = Token.token;
+            code_generator(tree, NOLABEL, NOLABEL, NOLABEL, NOLABEL, 0);
+            freeloclsyms();
+        }
+        else
+        {
+            // 解析全局变量声明
+            var_declaration(type, 0, 0, 0);
+            finaltoken = Token.token;
+        }
+        // 遇到EOF结束
+        if (finaltoken == T_EOF)   break;
+    }
+}
+
+// stmt.c
+
+// 分析单个语句
+struct ASTnode *single_statement();
+
+// 分析打印语句
+struct ASTnode *print_statement()
+{
+    struct ASTnode *tree;
+    // 匹配第一个"print"单词
+    match(T_PRINT, "print");
+    // 分析表达式并生成汇编代码
+    tree = binexpr(0);
+    // 生成一个printAST树
+    tree = mkastunary(A_PRINT, tree, 0);
+    return tree;
+}
+
+void adjust_cmp(struct ASTnode *condAST)
+{
+    if(condAST == NULL || condAST->right == NULL)
+    {
+        return;
+    }
+    if(condAST->op == A_LOGNOT)
+    {        
+        if(condAST->right->op < A_LOGOR || (condAST->right->op > A_GE && condAST->right->op != A_LOGNOT))
+        {
+            struct ASTnode *t;
+            t = mkastleaf(A_INT, 0);
+            condAST->left = t;
+            condAST->op = A_EQ;
+        }
+    }
+    else if(condAST->op == A_LOGAND || condAST->op == A_LOGOR)
+    {
+        if(condAST->right->op < A_LOGOR || (condAST->right->op > A_GE && condAST->right->op != A_LOGNOT))
+        {
+            struct ASTnode *t1, *t2;
+            t1 = mkastleaf(A_INT, 0);
+            t2 = mkastnode(A_NE, t1, NULL, condAST->right, 0);
+            condAST->right = t2;
+        }
+        if(condAST->left->op < A_LOGOR || (condAST->left->op > A_GE && condAST->left->op != A_LOGNOT))
+        {
+            struct ASTnode *t1, *t2;
+            t1 = mkastleaf(A_INT, 0);
+            t2 = mkastnode(A_NE, t1, NULL, condAST->left, 0);
+            condAST->left = t2;
+        }
+    }
+    adjust_cmp(condAST->left);
+    adjust_cmp(condAST->right);
+}
+
+// 分析包含可选ELSE的IF语句，并返回AST
+struct ASTnode *if_statement()
+{
+    struct ASTnode *condAST, *trueAST, *falseAST = NULL;
+    // 匹配if和"("
+    match(T_IF, "if");
+    lparen();
+    // 分析以下表达式和后面的')'，确保树的操作是一个比较
+    condAST = binexpr(0);
+    if (condAST->op < A_LOGOR || (condAST->op > A_GE && condAST->op != A_LOGNOT))
+    {
+        struct ASTnode *t;
+        t = mkastleaf(A_INT, 0);
+        condAST = mkastnode(A_NE, t, NULL, condAST, 0);
+        // fprintf(stderr, "Bad comparison operator on line %d\n", Line);
+        // exit(1);
+    }
+    adjust_cmp(condAST);
+    rparen();
+    // 获得语句块的AST
+    if(Token.token == T_LBRACE)
+    {
+        trueAST = Block_statement();
+    }
+    else
+    {
+        trueAST = single_statement();
+        if(Token.token == T_SEM)
+        {
+            scan(&Token);
+        }
+    }
+    // 如果有"else"，获得它的语句块的AST
+    if (Token.token == T_ELSE)
+    {
+        scan(&Token);
+        if(Token.token == T_LBRACE)
+        {
+            falseAST = Block_statement();
+        }
+        else
+        {
+            falseAST = single_statement();
+            if(Token.token == T_SEM)
+            {
+                scan(&Token);
+            }
+        }
+    }
+    // 生成和返回AST
+    return mkastnode(A_IF, condAST, trueAST, falseAST, 0);
+}
+
+// 分析WHILE语句，并返回AST
+struct ASTnode *while_statement()
+{
+    struct ASTnode *condAST, *bodyAST;
+    // 匹配"while"和"("
+    match(T_WHILE, "while");
+    lparen();
+    // 分析以下表达式和后面的')'，
+    // 确保树的操作是一个比较。
+    condAST = binexpr(0);
+    if (condAST->op < A_LOGOR || (condAST->op > A_GE && condAST->op != A_LOGNOT))
+    {
+        struct ASTnode *t;
+        t = mkastleaf(A_INT, 0);
+        condAST = mkastnode(A_NE, t, NULL, condAST, 0);
+        // fprintf(stderr, "Bad comparison operator on line %d\n", Line);
+        // exit(1);
+    }
+    adjust_cmp(condAST);
+    rparen();
+    // 获得语句块的AST
+    if(Token.token == T_LBRACE)
+    {
+        bodyAST = Block_statement();
+    }
+    else
+    {
+        bodyAST = single_statement();
+        if(Token.token == T_SEM)
+        {
+            scan(&Token);
+        }
+    }
+    // 生成并返回AST
+    return mkastnode(A_WHILE, condAST, NULL, bodyAST, 0);
+}
+
+// 分析return语句，并返回其AST树
+static struct ASTnode *return_statement()
+{
+    struct ASTnode *tree;
+    // 如果是void函数，不返回值，报错
+    if (Tsym[Functionid].type == P_VOID)
+    {
+        match(T_RETURN, "return");
+        match(T_SEM, ";");
+        tree = mkastunary(A_RETURN, NULL, 0);
+        return tree;
+        // fprintf(stderr, "Can't return from a void function on line %d\n", Line);
+        // exit(1);
+    }
+    // 匹配'return'
+    match(T_RETURN, "return");
+    //lparen();
+    // 分析接下来的语句
+    tree = binexpr(0);
+    // 添加一个A_RETURN节点
+    tree = mkastunary(A_RETURN, tree, 0);
+    //rparen();
+    return tree;
+}
+
+struct ASTnode *break_statement()
+{
+    scan(&Token);
+    match(T_SEM, ";");
+    return mkastleaf(A_BREAK, 0);
+}
+
+struct ASTnode *continue_statement()
+{
+    scan(&Token);
+    match(T_SEM, ";");
+    return mkastleaf(A_CONTINUE, 0);
+}
+
+// 分析一条语句，并返回其AST树
+struct ASTnode *single_statement()
+{
+    int type;
+    switch (Token.token)
+    {
+        case T_PRINT:   return print_statement();
+        case T_CONST:   scan(&Token); type = parse_type(); ident(); return var_declaration(type, 1, 0, 1);
+        case T_KEYINT:  type = parse_type(); ident(); return var_declaration(type, 1, 0, 0);
+        case T_IF:      return if_statement();
+        case T_WHILE:   return while_statement();
+        case T_RETURN:  return return_statement();
+        case T_BREAK:   return break_statement();
+        case T_CONTINUE: return continue_statement();
+        case T_LBRACE:  return Block_statement();
+        default:
+        {
+            // 判断这是否是一个表达式,这会捕获赋值语句。
+            return binexpr(0);
+        }
+    }
+    return NULL;
+}
+
+// 分析语句块并返回其AST
+struct ASTnode *Block_statement()
+{
+    struct ASTnode *left = NULL;
+    struct ASTnode *tree;
+    // 匹配"{"
+    lbrace();
+    advance_scope();
+    while (Token.token != T_RBRACE)
+    {
+        // 分析单个语句
+        tree = single_statement();
+        // 一些句子后面要识别";"
+        // if (tree != NULL && (tree->op == A_ASSIGN || tree->op == A_RETURN || tree->op == A_PRINT))
+        //     semi();
+        // if((tree == NULL || tree->op == A_FUNCTIONCALL) && Token.token == T_SEM)
+        // {
+        //     scan(&Token);
+        // }
+        if(Token.token == T_SEM)
+        {
+            scan(&Token);
+        }
+        // 对于每个新树，如果左子树为空，则将其保存在左子树中，
+        // 否则将左子树和新树合并
+        if (tree && (tree->op == A_PRINT || tree->op == A_IF || tree->op == A_WHILE || tree->op == A_RETURN || tree->op == A_BREAK ||tree->op == A_CONTINUE || tree->op == A_PRINT || tree->op == A_ASSIGN || tree->op == A_FUNCTIONCALL || tree->op == A_GLUE))
+        {
+            if (left == NULL)   left = tree;
+            else    left = mkastnode(A_GLUE, left, NULL, tree, 0);
+        }
+    }
+    // 遇到"}"时，跳过并返回AST
+    rbrace();
+    back_scope();
+    return left;
+}
+
+// main.c
+
+void init()
+{
+    Line = 1;
+    outLine = 0;
+    Putbackchr = '\n';
+}
+
+// 头文件预处理函数
+void head_file_preamble()
+{
+    const char *function_name[] = {"getint", "putint", "putch", "getch", "getarray", "putarray", "starttime", "stoptime"};
+    for(int i = 0;i < 8;i++)
+    {
+        Tsym[i + SYMBOL_NUM + 10000].name = strdup(function_name[i]);
+        Tsym[i + SYMBOL_NUM + 10000].type = P_INT;
+        Tsym[i + SYMBOL_NUM + 10000].stype = S_FUNCTION;
+    }
+}
+
+// 用法 compiler -o -s outfile infile
+int main(int argc, char *argv[])
+{
+    if(argc != 5)
+    {
+        fprintf(stderr, "compiler -o -s outfile infile\n");
+        exit(38);
+    }
+    init();
+    if ((Infile = fopen(argv[4], "r")) == NULL)
+    {
+        fprintf(stderr, "Unable to open %s: %s\n", argv[4], strerror(errno));
+        exit(39);
+    }
+    if ((Outfile = fopen(argv[3], "w")) == NULL)
+    {
+        fprintf(stderr, "Unable to create %s: %s\n", argv[4], strerror(errno));
+        exit(40);
+    }
+    head_file_preamble();               // 头文件初始化
+    scan(&Token);			            // 从输入中获得第一个单词
+    arm_preamble();
+    global_declarations();	            // 分析全局变量或者函数
+    arm_postamble();
+    fclose(Outfile);
+}
+
+// 2 + 3 * 4 / 5 % 6 - 7 + 8
