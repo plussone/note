@@ -101,7 +101,7 @@ struct symbol_table
     int size;                   // 数组大小
     int gl_class;			    // 符号类别
     int posn;			        // 距离栈基指针的偏移地址
-    int offset[10];             // 数组维度偏移地址
+    int offset[100];            // 数组维度偏移地址
     int *value;                 // 变量初始值指针
 };
 
@@ -1123,6 +1123,7 @@ void arm_free_register(int reg)
 {
     if (freereg[reg] != 0 && reg > 3)
     {
+        return;
         fprintf(stderr, "Error trying to free register %d\n", reg);
         exit(18);
     }
@@ -1381,9 +1382,9 @@ int arm_compare_and_jump(int ASTop, int r1, int r2, int label)
     }
     fprintf(Outfile, "\tcmp\tr%d, r%d\n", r1, r2);
     fprintf(Outfile, "\tb%s\tL%d\n", invcmplist[ASTop - A_EQ], label);
-    // arm_freeall_registers();
-    arm_free_register(r1);
-    arm_free_register(r2);
+    arm_freeall_registers();
+    // arm_free_register(r1);
+    // arm_free_register(r2);
     literal(2);
     return NOREG;
 }
@@ -1472,9 +1473,8 @@ void arm_print_reg(int reg)
 // 储存函数前四位参数的寄存器号
 int temp_param[5];
 
-void arm_save_register(int num_args)
+void arm_save_register(int num_args, char* save_reg)
 {
-    char save_reg[100] = "";
     for (int i = 4; i < 12; i++)
     {
         if(!freereg[i])
@@ -1497,21 +1497,13 @@ void arm_save_register(int num_args)
 }
 
 // 使用给定寄存器中的一个参数调用函数,返回带有结果的寄存器
-int arm_call(int id, int num_args)
+int arm_call(int id, int num_args, char *save_reg)
 {
     for (int i = 0; i < (min(num_args, 4)); i++)
     {
         fprintf(Outfile, "\tmov\tr%d, r%d\n", i, temp_param[i + 1]);
-        arm_free_register(temp_param[i + 1]);
+        // arm_free_register(temp_param[i + 1]);
         literal(1);
-    }
-    char save_reg[100] = "";
-    for (int i = 4; i < 12; i++)
-    {
-        if(!freereg[i])
-        {
-            sprintf(save_reg, "%sr%d, ", save_reg, i);
-        }
     }
     int len = strlen(save_reg);
     fprintf(Outfile, "\tbl\t%s\n", Tsym[id].name);
@@ -1523,7 +1515,6 @@ int arm_call(int id, int num_args)
     }
     if(len)
     {
-        save_reg[len - 2] = '\0';
         fprintf(Outfile, "\tpop\t{%s}\n", save_reg);
         literal(1);
     }
@@ -1832,7 +1823,8 @@ int code_funcall_generator(struct ASTnode *n)
     // 如果有参数列表，
     // 则从左到右遍历该列表
     // 保存寄存器
-    arm_save_register(numargs);
+    char sum[200] = "";
+    arm_save_register(numargs, sum);
     while (gluetree)
     {
         // 计算表达式值
@@ -1843,8 +1835,8 @@ int code_funcall_generator(struct ASTnode *n)
         if (numargs==0) numargs= gluetree->v.size;
         gluetree = gluetree->left;
     }
-    // arm_freeall_registers();
-    return arm_call(n->v.id, numargs);
+    arm_freeall_registers();
+    return arm_call(n->v.id, numargs, sum);
 }
 
 // 给定一个 AST、一个可选标签和父级的AST操作，
