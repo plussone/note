@@ -11,8 +11,8 @@
 #define PARAM_NUM    10240   // 参数表长度
 #define NOREG	     -1		 // AST生成函数没有要返回的寄存器
 #define NOLABEL      0       // 当我们没有标签传递给AST生成函数时使用
-#define MAXINTS      10240   // 大整数储存上限
-#define SCOPE_NUM    102400  // 作用域长度上限
+#define MAXINTS      1024    // 大整数储存上限
+#define SCOPE_NUM    10240   // 作用域长度上限
 
 #define max(a,b)    (a > b ? a : b)   // a,b中的最大值
 #define min(a,b)    (a < b ? a : b)   // a,b中的最小值
@@ -101,7 +101,7 @@ struct symbol_table
     int size;                   // 数组大小
     int gl_class;			    // 符号类别
     int posn;			        // 距离栈基指针的偏移地址
-    int offset[1000];           // 数组维度偏移地址
+    int offset[100];            // 数组维度偏移地址
     int *value;                 // 变量初始值指针
 };
 
@@ -945,10 +945,6 @@ int OpPrec[] = {0, 10, 20, 30, 40, 40, 80, 80, 80, 80, 90, 90, 100, 100, 100, 11
 // 若是一个二元运算符，返回它的优先级，否则报错
 int op_precedence(int tokentype)
 {
-    if(tokentype > 15)
-    {
-        exit(150);
-    }
     int prec = OpPrec[tokentype];
     if (prec == 0)
     {
@@ -1148,7 +1144,17 @@ void literal(int u)
     {
         int i = label();
         fprintf(Outfile, "\tb\tL%d\n\t.ltorg\nL%d:\n", i, i);
-        outLine = 0;
+        outLine = 3;
+    }
+}
+
+void literal_lite(int u)
+{
+    outLine += u;
+    if(outLine > 900)
+    {
+        fprintf(Outfile, "\t.ltorg\n");
+        outLine = 1;
     }
 }
 
@@ -1603,14 +1609,14 @@ int arm_stor_var(int r, int id, int address)
 void arm_global_sym(int id)
 {
     fprintf(Outfile, "\t.text\n\t.comm\t%s,%d,4\n", Tsym[id].name, 4 * Tsym[id].size);
-    literal(2);
+    literal_lite(2);
 }
 
 // 生成全局变量符号表,且赋初始值
 void arm_global_symassign(int id)
 {
+    literal_lite(7 + Tsym[id].size);
     fprintf(Outfile, "\t.text\n\t.global %s\n\t.data\n\t.align  2\n\t.type   %s, %%object\n\t.size   %s, %d\n%s:\n", Tsym[id].name, Tsym[id].name, Tsym[id].name, Tsym[id].size * 4, Tsym[id].name);
-    literal(7);
     int number = 0;
     for(int i = 0;i < Tsym[id].size;i++)
     {
@@ -1620,10 +1626,8 @@ void arm_global_symassign(int id)
             {
                 fprintf(Outfile,"\t.space   %d\n", number * 4);
                 number = 0;
-                literal(1);
             }
             fprintf(Outfile,"\t.word   %d\n",Tsym[id].value[i]);
-            literal(1);
         }
         else
         {
@@ -1633,9 +1637,9 @@ void arm_global_symassign(int id)
     if(number > 0)
     {
         fprintf(Outfile,"\t.space   %d\n", number * 4);
-        literal(1);
         number = 0;
     }
+    literal_lite(7 + Tsym[id].size);
 }
 
 // 生成return语句代码
@@ -1671,7 +1675,7 @@ void arm_preamble()
         ".LC0:\n"
         "\t.ascii  \"%d\\012\\000\"\n",
     Outfile);
-    literal(6);
+    literal_lite(6);
 }
 
 // 生成函数前言
@@ -1717,8 +1721,8 @@ void arm_function_preamble(char *name, int varlocalnum)
 void arm_function_postamble(int id)
 {
     arm_label(Tsym[id].endlabel);
-    fputs("\tsub\tsp, fp, #4\n" "\tpop\t{fp, pc}\n\t.ltorg\n" "\t.align\t2\n", Outfile);
-    outLine = 0;
+    fputs("\t.ltorg\n\tsub\tsp, fp, #4\n" "\tpop\t{fp, pc}\n" "\t.align\t2\n", Outfile);
+    outLine = 4;
 }
 
 // 汇编尾代码
@@ -1729,21 +1733,17 @@ void arm_postamble()
         ".L3:\n"
         "\t.word   .LC0\n",
     Outfile);
-    literal(2);
     for (int i = 0; i < Intslot; i++)
     {
         fprintf(Outfile, "\t.word   %d\n", Intlist[i]);
-        literal(1);
     }
     // 打印全局变量
     fprintf(Outfile, ".L2:\n");
-    literal(1);
     for (int i = 0; i < Globals; i++)
     {
         if (Tsym[i].stype != S_FUNCTION && Tsym[i].gl_class == C_GLOBAL)
         {
             fprintf(Outfile, "\t.word   %s\n", Tsym[i].name);
-            literal(1);
         }
     }
 }
@@ -1857,12 +1857,6 @@ int code_funcall_generator(struct ASTnode *n)
     }
     // arm_freeall_registers();
     return arm_call(n->v.id, numargs);
-}
-
-int tree_length(struct ASTnode *tree)
-{
-    if(!tree) return 0;
-    else return max(tree_length(tree->left), tree_length(tree->right)) + 1;
 }
 
 // 给定一个 AST、一个可选标签和父级的AST操作，
@@ -2064,18 +2058,10 @@ struct ASTnode *arrat_equ(int *aix, int islocal, int length, int id, int ifconst
 {
     struct ASTnode * left = NULL, *right, *tree, *address;
     int start = *aix;
-    if(Tsym[id].offset[length] == -1)
-    {
-        exit(151);
-    }
     while((*aix - start) < Tsym[id].offset[length])
     {
         if(Token.token == T_LBRACE)
         {
-            if(Tsym[id].offset[length + 1] == -1)
-            {
-                exit(151);
-            }
             int mod_num = (*aix - start) % Tsym[id].offset[length+1];
             int tlength = mod_num > 0 ? Tsym[id].offset[length+1] - mod_num : 0;
             for(int i = 0; i < tlength;i++)
@@ -2174,7 +2160,7 @@ struct ASTnode *var_declaration(int type, int islocal, int isparam, int ifconst)
         // 现在是标识符，如果下一个标记是"["
         if (Token.token == T_LBRACKET)
         {
-            char tname[TEXTLEN + 1];
+            char tname[TEXTLEN];
             strcpy(tname, Text);
             if(islocal)
             {
