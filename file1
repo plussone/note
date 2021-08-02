@@ -903,13 +903,16 @@ struct ASTnode *primary()
             n = mkastnode(A_LOGNOT, NULL, NULL, tree, 0);
             reject_token(&Token);
             break;
+        case T_SEM:
+            n = NULL;
+            break;
         // case T_RBRACE:
         //     break;
         default:
         {
             printf("111\n");
             fprintf(stderr, "syntax error, token %d on line %d\n", Token.token, Line);
-            exit(13);
+            exit(100 + Token.token);
         }
     }
     // 扫描下一个单词,并返回左节点
@@ -960,6 +963,10 @@ struct ASTnode *binexpr(int pretokentype)
 
     // 获取左节点的整数，同时获取下一个单词
     left = primary();
+    if(left == NULL)
+    {
+        return left;
+    }
     // 如果下一个单词是';'或者')'或者']'，则返回左节点
     tokentype = Token.token;
     
@@ -1473,8 +1480,9 @@ void arm_print_reg(int reg)
 // 储存函数前四位参数的寄存器号
 int temp_param[5];
 
-void arm_save_register(int num_args, char* save_reg)
+void arm_save_register(int num_args)
 {
+    char save_reg[100] = "";
     for (int i = 4; i < 12; i++)
     {
         if(!freereg[i])
@@ -1497,13 +1505,21 @@ void arm_save_register(int num_args, char* save_reg)
 }
 
 // 使用给定寄存器中的一个参数调用函数,返回带有结果的寄存器
-int arm_call(int id, int num_args, char *save_reg)
+int arm_call(int id, int num_args)
 {
     for (int i = 0; i < (min(num_args, 4)); i++)
     {
         fprintf(Outfile, "\tmov\tr%d, r%d\n", i, temp_param[i + 1]);
-        // arm_free_register(temp_param[i + 1]);
+        arm_free_register(temp_param[i + 1]);
         literal(1);
+    }
+    char save_reg[100] = "";
+    for (int i = 4; i < 12; i++)
+    {
+        if(!freereg[i])
+        {
+            sprintf(save_reg, "%sr%d, ", save_reg, i);
+        }
     }
     int len = strlen(save_reg);
     fprintf(Outfile, "\tbl\t%s\n", Tsym[id].name);
@@ -1515,6 +1531,7 @@ int arm_call(int id, int num_args, char *save_reg)
     }
     if(len)
     {
+        save_reg[len - 2] = '\0';
         fprintf(Outfile, "\tpop\t{%s}\n", save_reg);
         literal(1);
     }
@@ -1823,8 +1840,7 @@ int code_funcall_generator(struct ASTnode *n)
     // 如果有参数列表，
     // 则从左到右遍历该列表
     // 保存寄存器
-    char sum[200] = "";
-    arm_save_register(numargs, sum);
+    arm_save_register(numargs);
     while (gluetree)
     {
         // 计算表达式值
@@ -1835,8 +1851,8 @@ int code_funcall_generator(struct ASTnode *n)
         if (numargs==0) numargs= gluetree->v.size;
         gluetree = gluetree->left;
     }
-    arm_freeall_registers();
-    return arm_call(n->v.id, numargs, sum);
+    // arm_freeall_registers();
+    return arm_call(n->v.id, numargs);
 }
 
 // 给定一个 AST、一个可选标签和父级的AST操作，
