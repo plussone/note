@@ -1225,10 +1225,8 @@ void set_int_offset(int val)
 }
 
 // 将立即数加载到寄存器中，返回寄存器编号
-int arm_load_int(int value)
+int arm_load_int(int value, int flag)
 {
-    // 获得新的寄存器
-    int r = arm_alloc_register();
     // // 小数字用MOV，大数字用LDR操作
     // if (value <= 2000)
     // {
@@ -1239,7 +1237,20 @@ int arm_load_int(int value)
     //     set_int_offset(value);
     //     fprintf(Outfile, "\tmov\tr%d, r3\n", r);
     // }
-    fprintf(Outfile, "\tldr\tr%d, =#%d\n", r, value);
+    if(flag)
+    {
+        // 获得新的寄存器
+        int r = arm_alloc_register();
+        fprintf(Outfile, "\tldr\tr%d, =#%d\n", r, value);
+        literal(1);
+        return r;
+    }
+    else
+    {
+        fprintf(Outfile, "\tldr\tr2, =#%d\n", value);
+        literal(1);
+        return NOREG;
+    }
     // if (value <= 65535)
     // {
     //     fprintf(Outfile, "\tmov\tr%d, #%d\n", r, value);
@@ -1249,8 +1260,6 @@ int arm_load_int(int value)
     //     fprintf(Outfile, "\tmov\tr%d, #%d\n", r, value % 65536);
     //     fprintf(Outfile, "\tmovt\tr%d, #%d\n", r, value >> 16);
     // }
-    literal(1);
-    return r;
 }
 
 // 确定变量与.L2标签的偏移量
@@ -1265,17 +1274,17 @@ void set_varglobal_offset(int id)
     literal(2);
 }
 
-// 将变量中的值加载到寄存器中，并返回寄存器编号
-int arm_load_global(int id, int address)
-{
-    // 获得变量偏移地址
-    set_varglobal_offset(id);
-    // 获得一个新的寄存器
-    int r = arm_alloc_register();
-    fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
-    literal(1);
-    return r;
-}
+// // 将变量中的值加载到寄存器中，并返回寄存器编号
+// int arm_load_global(int id, int address)
+// {
+//     // 获得变量偏移地址
+//     set_varglobal_offset(id);
+//     // 获得一个新的寄存器
+//     int r = arm_alloc_register();
+//     fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
+//     literal(1);
+//     return r;
+// }
 
 // 确定变量与堆栈基址指针的偏移量
 void set_varlocal_offset(int id)
@@ -1285,9 +1294,8 @@ void set_varlocal_offset(int id)
         int t = Tsym[id].posn + 4;
         if(t > 255)
         {
-            int r = arm_load_int(t);
-            fprintf(Outfile, "\tadd\tr3, fp, r%d\n", r);
-            arm_free_register(r);
+            arm_load_int(t, 0);
+            fprintf(Outfile, "\tadd\tr3, fp, r2\n");
         }
         else
         {
@@ -1299,9 +1307,8 @@ void set_varlocal_offset(int id)
         int t = Tsym[id].posn * -1 + 4;
         if(t > 255)
         {
-            int r = arm_load_int(t);
-            fprintf(Outfile, "\tsub\tr3, fp, r%d\n", r);
-            arm_free_register(r);
+            arm_load_int(t, 0);
+            fprintf(Outfile, "\tsub\tr3, fp, r2\n");
         }
         else
         {
@@ -1550,9 +1557,8 @@ void arm_save_register(int num_args)
     {
         if((num_args - 4) * 4 > 255)
         {
-            int l = arm_load_int((num_args - 4) * 4);
-            fprintf(Outfile, "\tsub\tsp, sp, r%d\n", l);
-            arm_free_register(l);
+            arm_load_int((num_args - 4) * 4, 0);
+            fprintf(Outfile, "\tsub\tsp, sp, r2\n");
         }
         else
         {
@@ -1586,9 +1592,8 @@ int arm_call(int id, int num_args)
     {
         if((num_args - 4) * 4 > 255)
         {
-            int l = arm_load_int((num_args - 4) * 4);
-            fprintf(Outfile, "\tadd\tsp, sp, r%d\n", l);
-            arm_free_register(l);
+            arm_load_int((num_args - 4) * 4, 0);
+            fprintf(Outfile, "\tadd\tsp, sp, r2\n");
         }
         else
         {
@@ -1621,9 +1626,8 @@ void arm_copy_arg(int r, int argposn)
     {
         if((argposn - 5) * 4 > 255)
         {
-            int l = arm_load_int((argposn - 5) * 4);
-            fprintf(Outfile, "\tstr\tr%d, [sp, r%d]\n", r, l);
-            arm_free_register(l);
+            arm_load_int((argposn - 5) * 4, 0);
+            fprintf(Outfile, "\tstr\tr%d, [sp, r2]\n", r);
         }
         else
         {
@@ -1743,7 +1747,7 @@ void arm_function_preamble(char *name, int varlocalnum)
     {
         stackOffset += Tsym[i].size;
     }
-    stackOffset = (stackOffset + uparam_num) * 4;
+    stackOffset = (stackOffset + uparam_num + 50) * 4;
     fprintf(Outfile,
         "\t.text\n"
         "\t.align  2\n"
@@ -1755,9 +1759,8 @@ void arm_function_preamble(char *name, int varlocalnum)
     literal(7);
     if(stackOffset > 255)
     {
-        int l = arm_load_int(stackOffset);
-        fprintf(Outfile, "\tsub\tsp, sp, r%d\n", l);
-        arm_free_register(l);
+        arm_load_int(stackOffset, 0);
+        fprintf(Outfile, "\tsub\tsp, sp, r2\n");
         literal(1);
     }
     else
@@ -2005,7 +2008,7 @@ int code_generator(struct ASTnode *n, int ifflase, int iftrue, int loopstartlabe
             if(parentASTop == A_IF || parentASTop == A_WHILE)
                 return arm_compare_and_jump(n->op, leftreg, rightreg, ifflase);
             else return arm_compare_and_set(n->op, leftreg, rightreg);
-        case A_INT:    return arm_load_int(n->v.intvalue);
+        case A_INT:    return arm_load_int(n->v.intvalue, 1);
         case A_IDENT:  // 如果标识符是右值，则加载它的值
                        if (n->rvalue || parentASTop == A_ADDRESS) return arm_load_var(n->v.id, n->address);
                        else return NOREG;
