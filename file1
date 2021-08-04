@@ -13,6 +13,7 @@
 #define NOLABEL      0       // 当我们没有标签传递给AST生成函数时使用
 #define MAXINTS      1024    // 大整数储存上限
 #define SCOPE_NUM    10240   // 作用域长度上限
+#define REG_NUM      11      // 寄存器数量
 
 #define max(a,b)    (a > b ? a : b)   // a,b中的最大值
 #define min(a,b)    (a < b ? a : b)   // a,b中的最小值
@@ -116,6 +117,7 @@ void arm_function_postamble(int id);
 void match(int t, char *what);
 int arm_get_localoffset(int type, int size);
 int label();
+void literal(int u);
 
 // data.h
 int             Line;                               // 当前读入行数
@@ -136,6 +138,7 @@ int use_param_num;                                  // 函数中使用的参数�
 int have_param_num;                                 // 函数参数的数量
 int outLine;                                        // 代码输出行数
 int function_num = 8;                               // 文件头函数数量
+int spillreg = 0;                                   // 溢出寄存器数量
 
 const char *function_name[] = {"getint", "putint", "putch", "getch", "getarray", "putarray", "starttime", "stoptime"};
 
@@ -333,8 +336,8 @@ int add_local(char *name, int type, int stype, int isparam, int size)
 {
     int y, posn;
     // 如果已经在符号表中，则返回现有位置
-    if ((y = find_local(name)) != -1)
-        return y;
+    // if ((y = find_local(name)) != -1)
+    //     return y;
     if(isparam)
     {
         have_param_num++;
@@ -510,8 +513,8 @@ int match_keyword(char *s)
         case 'i':   if(!strcmp(s, "if"))     return T_IF;
                     if(!strcmp(s, "int"))    return T_KEYINT;
                     break;
-        // case 'p':   if(!strcmp(s, "print"))  return T_PRINT;
-        //             break;
+        case 'p':   if(!strcmp(s, "print"))  return T_PRINT;
+                    break;
         case 'r':   if(!strcmp(s, "return")) return T_RETURN;
                     break;
         case 'w':   if(!strcmp(s, "while"))  return T_WHILE;
@@ -1101,8 +1104,23 @@ int arm_get_localoffset(int type, int size)
 }
 
 // 可用寄存器列表及其名称
-int freereg[12];
+int freereg[REG_NUM];
 // char *reglist[12]= {"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"};
+
+// 寄存器入栈
+void pushreg(int r)
+{
+    fprintf(Outfile, "\tpush\t{r%d}\n", r);
+    literal(1);
+}
+
+// 寄存器出栈
+void popreg(int r)
+{
+    fprintf(Outfile, "\tpop\t{r%d}\n", r);
+    literal(1);
+}
+
 
 // 将所有寄存器设置为可用
 void arm_freeall_registers()
@@ -1114,7 +1132,8 @@ void arm_freeall_registers()
 // 如果没有可用的寄存器，则结束。
 int arm_alloc_register()
 {
-    for (int i = 4; i < 12; i++)
+    int i;
+    for (int i = 4; i < REG_NUM; i++)
     {
         if (freereg[i])
         {
@@ -1122,8 +1141,13 @@ int arm_alloc_register()
             return i;
         }
     }
-    fprintf(stderr, "Out of registers!\n");
-    exit(17);
+    // 寄存器溢出
+    i = (spillreg % (REG_NUM - 4) + 4);
+    spillreg++;
+    pushreg(i);
+    return i;
+    // fprintf(stderr, "Out of registers!\n");
+    // exit(17);
 }
 
 // 检查寄存器是否已经存在，
@@ -1136,7 +1160,17 @@ void arm_free_register(int reg)
         fprintf(stderr, "Error trying to free register %d\n", reg);
         exit(18);
     }
-    freereg[reg]= 1;
+    // 如果有溢出寄存器，则拿回来
+    if (spillreg > 0)
+    {
+        spillreg--;
+        reg = (spillreg % (REG_NUM - 4) + 4);
+        popreg(reg);
+    }
+    else
+    {
+        freereg[reg] = 1;
+    }
 }
 
 void literal(int u)
@@ -1234,10 +1268,10 @@ void set_varglobal_offset(int id)
 // 将变量中的值加载到寄存器中，并返回寄存器编号
 int arm_load_global(int id, int address)
 {
-    // 获得一个新的寄存器
-    int r = arm_alloc_register();
     // 获得变量偏移地址
     set_varglobal_offset(id);
+    // 获得一个新的寄存器
+    int r = arm_alloc_register();
     fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
     literal(1);
     return r;
@@ -1249,30 +1283,30 @@ void set_varlocal_offset(int id)
     if (Tsym[id].posn >= 0)
     {
         int t = Tsym[id].posn + 4;
-        // if(t > 2000)
-        // {
-        int r = arm_load_int(t);
-        fprintf(Outfile, "\tadd\tr3, fp, r%d\n", r);
-        arm_free_register(r);
-        // }
-        // else
-        // {
-        //     fprintf(Outfile, "\tadd\tr3, fp, #%d\n", t);
-        // }
+        if(t > 255)
+        {
+            int r = arm_load_int(t);
+            fprintf(Outfile, "\tadd\tr3, fp, r%d\n", r);
+            arm_free_register(r);
+        }
+        else
+        {
+            fprintf(Outfile, "\tadd\tr3, fp, #%d\n", t);
+        }
     }
     else
     {
         int t = Tsym[id].posn * -1 + 4;
-        // if(t > 2000)
-        // {
-        int r = arm_load_int(t);
-        fprintf(Outfile, "\tsub\tr3, fp, r%d\n", r);
-        arm_free_register(r);
-        // }
-        // else
-        // {
-        //     fprintf(Outfile, "\tsub\tr3, fp, #%d\n", t);
-        // }
+        if(t > 255)
+        {
+            int r = arm_load_int(t);
+            fprintf(Outfile, "\tsub\tr3, fp, r%d\n", r);
+            arm_free_register(r);
+        }
+        else
+        {
+            fprintf(Outfile, "\tsub\tr3, fp, #%d\n", t);
+        }
     }
     literal(1);
 }
@@ -1291,8 +1325,6 @@ void set_varlocal_offset(int id)
 // 将变量中的值加载到寄存器中，并返回寄存器编号
 int arm_load_var(int id, int address)
 {
-    // 获得一个新的寄存器
-    int r = arm_alloc_register();
     // 获得变量偏移地址
     if(Tsym[id].gl_class == C_GLOBAL)
     {
@@ -1307,6 +1339,8 @@ int arm_load_var(int id, int address)
         fprintf(stderr, "Bad function type in arm_load_var() on line %d\n", Line);
         exit(20);
     }
+    // 获得一个新的寄存器
+    int r = arm_alloc_register();
     fprintf(Outfile, "\tldr\tr%d, [r3]\n", r);
     literal(1);
     return r;
@@ -1384,6 +1418,7 @@ int arm_compare_and_set(int ASTop, int r1, int r2)
     fprintf(Outfile, "\tuxtb\tr%d, r%d\n", r1, r1);
     arm_free_register(r2);
     literal(4);
+    //注意点
     return r1;
 }
 
@@ -1401,9 +1436,9 @@ int arm_compare_and_jump(int ASTop, int r1, int r2, int label)
     }
     fprintf(Outfile, "\tcmp\tr%d, r%d\n", r1, r2);
     fprintf(Outfile, "\tb%s\tL%d\n", invcmplist[ASTop - A_EQ], label);
-    arm_freeall_registers();
-    // arm_free_register(r1);
-    // arm_free_register(r2);
+    // arm_freeall_registers();
+    arm_free_register(r1);
+    arm_free_register(r2);
     literal(2);
     return NOREG;
 }
@@ -1425,7 +1460,6 @@ void arm_jump(int l)
 // 生成代码将标识符的地址加载到寄存器中并返回
 int arm_address(int id, int address)
 {
-    int r = arm_alloc_register();
     // 获得变量偏移地址
     if(Tsym[id].gl_class == C_GLOBAL)
     {
@@ -1440,6 +1474,7 @@ int arm_address(int id, int address)
         fprintf(stderr, "Bad function type in arm_address() on line %d\n", Line);
         exit(23);
     }
+    int r = arm_alloc_register();
     fprintf(Outfile, "\tmov\tr%d, r3\n", r);
     literal(1);
     return r;
@@ -1452,18 +1487,19 @@ int arm_address(int id, int address)
 int arm_load_address(int l, int r, int flag)
 {
     fprintf(Outfile, "\tlsl\tr%d, r%d, #2\n", r, r);
-    fprintf(Outfile, "\tadd\tr%d, r%d, r%d\n", r, l, r);
-    arm_free_register(l);
+    // 注意点
+    fprintf(Outfile, "\tadd\tr%d, r%d, r%d\n", l, l, r);
+    arm_free_register(r);
     if(flag)
     {
-        fprintf(Outfile, "\tldr\tr%d, [r%d]\n", r, r);
+        fprintf(Outfile, "\tldr\tr%d, [r%d]\n", l, l);
         literal(3);
     }
     else
     {
         literal(2);
     }
-    return r;
+    return l;
 }
 
 // 生成代码把寄存器中的值写入地址
@@ -1496,7 +1532,7 @@ int temp_param[5];
 void arm_save_register(int num_args)
 {
     char save_reg[100] = "";
-    for (int i = 4; i < 12; i++)
+    for (int i = 4; i < REG_NUM; i++)
     {
         if(!freereg[i])
         {
@@ -1512,11 +1548,16 @@ void arm_save_register(int num_args)
     }
     if(num_args > 4)
     {
-		if(num_args > 12)
-		{
-			exit(num_args + 100);
-		}
-        fprintf(Outfile, "\tsub\tsp, sp, #%d\n", (num_args - 4) * 4);
+        if((num_args - 4) * 4 > 255)
+        {
+            int l = arm_load_int((num_args - 4) * 4);
+            fprintf(Outfile, "\tsub\tsp, sp, r%d\n", l);
+            arm_free_register(l);
+        }
+        else
+        {
+            fprintf(Outfile, "\tsub\tsp, sp, #%d\n", (num_args - 4) * 4);
+        }
         literal(1);
     }
 }
@@ -1531,7 +1572,7 @@ int arm_call(int id, int num_args)
         literal(1);
     }
     char save_reg[100] = "";
-    for (int i = 4; i < 12; i++)
+    for (int i = 4; i < REG_NUM; i++)
     {
         if(!freereg[i])
         {
@@ -1543,11 +1584,16 @@ int arm_call(int id, int num_args)
     literal(1);
     if(num_args > 4)
     {
-		if(num_args > 12)
-		{
-			exit(num_args + 100);
-		}
-        fprintf(Outfile, "\tadd\tsp, sp, #%d\n", (num_args - 4) * 4);
+        if((num_args - 4) * 4 > 255)
+        {
+            int l = arm_load_int((num_args - 4) * 4);
+            fprintf(Outfile, "\tadd\tsp, sp, r%d\n", l);
+            arm_free_register(l);
+        }
+        else
+        {
+            fprintf(Outfile, "\tadd\tsp, sp, #%d\n", (num_args - 4) * 4);
+        }
         literal(1);
     }
     if(len)
@@ -1573,16 +1619,16 @@ void arm_copy_arg(int r, int argposn)
     }
     else
     {
-        // if((argposn - 5) * 4 > 2000)
-        // {
-        int l = arm_load_int((argposn - 5) * 4);
-        fprintf(Outfile, "\tstr\tr%d, [sp, r%d]\n", r, l);
-        arm_free_register(l);
-        // }
-        // else
-        // {
-        //     fprintf(Outfile, "\tstr\tr%d, [sp, #%d]\n", r, (argposn - 5) * 4);
-        // }
+        if((argposn - 5) * 4 > 255)
+        {
+            int l = arm_load_int((argposn - 5) * 4);
+            fprintf(Outfile, "\tstr\tr%d, [sp, r%d]\n", r, l);
+            arm_free_register(l);
+        }
+        else
+        {
+            fprintf(Outfile, "\tstr\tr%d, [sp, #%d]\n", r, (argposn - 5) * 4);
+        }
         arm_free_register(r);
         literal(1);
     }
@@ -1707,18 +1753,18 @@ void arm_function_preamble(char *name, int varlocalnum)
         "\tpush    {fp, lr}\n"
         "\tadd     fp, sp, #4\n", name, name, name);
     literal(7);
-    // if(stackOffset > 2000)
-    // {
+    if(stackOffset > 255)
+    {
         int l = arm_load_int(stackOffset);
         fprintf(Outfile, "\tsub\tsp, sp, r%d\n", l);
         arm_free_register(l);
         literal(1);
-    // }
-    // else
-    // {
-    //     fprintf(Outfile, "\tsub\tsp, sp, #%d\n", stackOffset);
-    //     literal(1);
-    // }
+    }
+    else
+    {
+        fprintf(Outfile, "\tsub\tsp, sp, #%d\n", stackOffset);
+        literal(1);
+    }
     int hparam_num = have_param_num > 4 ? 4 : have_param_num;
     for (int i = 0; i < hparam_num; i++)
     {
@@ -1733,6 +1779,7 @@ void arm_function_postamble(int id)
     arm_label(Tsym[id].endlabel);
     fputs("\tsub\tsp, fp, #4\n" "\tpop\t{fp, pc}\n\t.ltorg\n" "\t.align\t2\n", Outfile);
     outLine = 1;
+    arm_freeall_registers();
 }
 
 // 汇编尾代码
